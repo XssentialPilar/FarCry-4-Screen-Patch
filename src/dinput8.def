@@ -1,0 +1,11 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create              = Proxy_DirectInput8Create        @1
+    DllCanUnloadNow                 = Proxy_DllCanUnloadNow           @2 PRIVATE
+    DllGetClassObject               = Proxy_DllGetClassObject         @3 PRIVATE
+    DllRegisterServer               = Proxy_DllRegisterServer         @4 PRIVATE
+    DllUnregisterServer             = Proxy_DllUnregisterServer       @5 PRIVATE
+    GetdfDIJoystick                 = Proxy_GetdfDIJoystick           @6
+    FC4_AspectFix_TestApply         = FC4_AspectFix_TestApply         @7
+    FC4_AspectFix_ComputeUiLayout   = ComputeAdaptiveUiLayout         @8
+    FC4_AspectFix_NormalizeViewport = NormalizeViewportStruct         @9
