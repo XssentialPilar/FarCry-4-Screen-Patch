@@ -2,19 +2,28 @@
 #include "hook_engine.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <unordered_map>
 
 namespace {
 
 constexpr UINT_PTR kAdaptiveTimerId = 0xFC41;
 constexpr UINT kAdaptiveTimerMs = 33;
+constexpr UINT kMsgStartTimer = WM_APP + 0x41;
 constexpr double kAppliedMarkerEps = 1e-4;
+constexpr DWORD kVideoSkipGraceMs = 350;
+constexpr DWORD kToggleToastMs = 2500;
 
 using FnTreeNext = void*(__fastcall*)(void* node);
 using FnIsValid = bool(__fastcall*)(void* gfxObj);
 using FnSetProp = uint32_t*(__fastcall*)(void* gfxObj, uint32_t* outStatus, double val);
+using FnSetVisible = uint32_t*(__fastcall*)(void* gfxObj, uint32_t* outStatus, uint8_t visible);
+using FnSetText = uint32_t*(__fastcall*)(void* gfxObj, uint32_t* outStatus, const wchar_t* text);
+using FnSpriteNodeSetVis = void(__fastcall*)(void* spriteNode, uint8_t visible);
+using FnSpriteNodeInval = uint8_t(__fastcall*)(void* spriteNode);
 using FnGetUi = void(__fastcall*)(void* uiSystem, void** outHolder, uint32_t idx);
 using FnGetBlackBarsId = uint8_t*(__fastcall*)(void);
 using FnLookupService = uint8_t*(__fastcall*)(void* uiMgr, void* idPtr);
@@ -23,27 +32,61 @@ using FnStaticBlackBarsSetVis = void(__fastcall*)(void* thisPtr, uint8_t visible
 using FnBlackBarsFadeIn = void(__fastcall*)(void* thisPtr);
 using FnBlackBarsFadeOut = void(__fastcall*)(void* thisPtr);
 
+// Dynamically loaded XInputGetState (zero static XInput DLL imports)
+struct XInputGamepad {
+    WORD wButtons;
+    BYTE bLeftTrigger;
+    BYTE bRightTrigger;
+    SHORT sThumbLX;
+    SHORT sThumbLY;
+    SHORT sThumbRX;
+    SHORT sThumbRY;
+};
+struct XInputState {
+    DWORD dwPacketNumber;
+    XInputGamepad Gamepad;
+};
+using FnXInputGetState = DWORD(WINAPI*)(DWORD dwUserIndex, XInputState* pState);
+
+struct Mesh2DVertex {
+    float x;
+    float y;
+    float z;
+    uint32_t color;
+    float u;
+    float v;
+};
+static_assert(sizeof(Mesh2DVertex) == 24, "Mesh2DVertex must be 24 bytes");
+
 struct EngineSymbols {
     HMODULE hFC64 = nullptr;
-    uint8_t** displayManagerPtr = nullptr;       // RVA 0x2dd84c8
-    uint8_t** renderConfigPtr = nullptr;         // RVA 0x2dd7e08
-    void** modeProviderPtr = nullptr;            // RVA 0x2dd8538
-    const void* modeProviderVTableExp = nullptr; // RVA 0x26d4b10
-    const void* optionsFilterRetAddr = nullptr;  // RVA 0xfaab36
-    uint8_t** uiMovieMgrPtr = nullptr;           // RVA 0x2e22980
-    const float* safeFrameFloats = nullptr;      // RVA 0x2d2b94c [L, R, T, B]
-    uint8_t** uiSystemPtr = nullptr;             // RVA 0x2e24c58
-    FnGetUi fnGetUi = nullptr;                   // RVA 0x83e3c0
-    FnGetBlackBarsId fnGetBlackBarsId = nullptr; // RVA 0x87dc80
-    FnLookupService fnLookupService = nullptr;   // RVA 0x7248e0
-    const void* blackBarsSetVisAddr = nullptr;   // RVA 0x74a990
-    const void* blackBarsFadeInAddr = nullptr;   // RVA 0x74a7d0
-    FnTreeNext fnTreeNext = nullptr;             // RVA 0x1d822e0
-    FnIsValid fnIsValid = nullptr;               // RVA 0x1cb8fa0
-    FnSetProp fnSetXScale = nullptr;             // RVA 0x1cb92f0
-    FnSetProp fnSetYScale = nullptr;             // RVA 0x1cb93b0
-    FnSetProp fnSetX = nullptr;                  // RVA 0x1cb9090
-    FnSetProp fnSetY = nullptr;                  // RVA 0x1cb9150
+    uint8_t** displayManagerPtr = nullptr;        // RVA 0x2dd84c8
+    uint8_t** renderConfigPtr = nullptr;          // RVA 0x2dd7e08
+    void** modeProviderPtr = nullptr;             // RVA 0x2dd8538
+    const void* modeProviderVTableExp = nullptr;  // RVA 0x26d4b10
+    const void* optionsFilterRetAddr = nullptr;   // RVA 0xfaab36
+    uint8_t** uiMovieMgrPtr = nullptr;            // RVA 0x2e22980
+    const float* safeFrameFloats = nullptr;       // RVA 0x2d2b94c [L, R, T, B]
+    uint8_t** uiSystemPtr = nullptr;              // RVA 0x2e24c58
+    FnGetUi fnGetUi = nullptr;                    // RVA 0x83e3c0
+    FnGetBlackBarsId fnGetBlackBarsId = nullptr;  // RVA 0x87dc80
+    FnLookupService fnLookupService = nullptr;    // RVA 0x7248e0
+    const void* blackBarsSetVisAddr = nullptr;    // RVA 0x74a990
+    const void* blackBarsFadeInAddr = nullptr;    // RVA 0x74a7d0
+    FnTreeNext fnTreeNext = nullptr;              // RVA 0x1d822e0
+    FnIsValid fnIsValid = nullptr;                // RVA 0x1cb8fa0
+    FnSetProp fnSetXScale = nullptr;              // RVA 0x1cb92f0
+    FnSetProp fnSetYScale = nullptr;              // RVA 0x1cb93b0
+    FnSetProp fnSetX = nullptr;                   // RVA 0x1cb9090
+    FnSetProp fnSetY = nullptr;                   // RVA 0x1cb9150
+    FnSetVisible fnSetVisible = nullptr;          // RVA 0x1cb9550
+    FnSetText fnSetText = nullptr;                // RVA 0x1cb99f0
+    FnSpriteNodeSetVis fnSpriteNodeSetVis = nullptr;   // RVA 0x1d32b00
+    FnSpriteNodeInval fnSpriteNodeInval = nullptr;     // RVA 0x1d2c180
+    uint8_t** mesh2DPoolHeaderPtr = nullptr;      // RVA 0x2d1e438
+    uint8_t** video2DArrayHeaderPtr = nullptr;    // RVA 0x2d1dc98
+    uint8_t** binkPlayerMgrPtr = nullptr;         // RVA 0x2e4c4a8
+    const void* binkResourceVTable = nullptr;     // RVA 0x26d50f0
     bool ready = false;
 };
 
@@ -62,10 +105,12 @@ struct AnchorCacheEntry {
     int32_t scaleFlags = -1;
     int32_t bScaleX = -1;
     int32_t bScaleY = -1;
+    uint8_t specialKind = 0;
 };
 
 PatchConfig g_Config{};
 EngineSymbols g_Sym{};
+wchar_t g_IniPath[MAX_PATH]{};
 volatile LONG g_SymbolsResolved = 0;
 volatile LONG g_ControllerStarted = 0;
 volatile LONG g_ShuttingDown = 0;
@@ -91,6 +136,19 @@ uint32_t g_LastLoggedW = 0;
 uint32_t g_LastLoggedH = 0;
 int32_t g_LastLoggedFovFlag = -1;
 
+// Pre-recorded Bink video skip & discrete native prompt state
+void* g_PromptGfxObj = nullptr;  // SubTitleText2 in fireuiplayer
+bool g_PromptOwnedByPatch = false;
+wchar_t g_LastPromptText[128]{};
+uint8_t* g_ActiveSkippableBinkRes = nullptr;
+DWORD g_ActiveBinkStartTick = 0;
+volatile LONG g_PendingSkipRequest = 0;
+DWORD g_ToggleToastUntilTick = 0;
+wchar_t g_ToggleToastText[128]{};
+FnXInputGetState g_FnXInputGetState = nullptr;
+bool g_XInputProbed = false;
+WORD g_PrevPadButtons[4]{};
+
 inline bool IsValidUserPtr(const void* p) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
     return addr >= 0x10000ULL && addr < 0x0000800000000000ULL;
@@ -105,6 +163,135 @@ inline int32_t ReadI32(const uint8_t* p) {
 inline uint64_t RvaOf(HMODULE hMod, const void* ptr) {
     return static_cast<uint64_t>(
         reinterpret_cast<const uint8_t*>(ptr) - reinterpret_cast<const uint8_t*>(hMod));
+}
+
+bool ContainsCaseInsensitiveW(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle || !*needle) {
+        return false;
+    }
+    const size_t nlen = wcslen(needle);
+    for (size_t i = 0; i < 96 && haystack[i] != 0; ++i) {
+        size_t j = 0;
+        while (j < nlen && haystack[i + j] != 0 &&
+               towlower(haystack[i + j]) == towlower(needle[j])) {
+            ++j;
+        }
+        if (j == nlen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool EqualsCaseInsensitiveW(const wchar_t* a, const wchar_t* b) {
+    if (!a || !b) {
+        return false;
+    }
+    size_t i = 0;
+    while (i < 96 && a[i] != 0 && b[i] != 0) {
+        if (towlower(a[i]) != towlower(b[i])) {
+            return false;
+        }
+        ++i;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+bool StartsWithCaseInsensitiveW(const wchar_t* s, const wchar_t* prefix) {
+    if (!s || !prefix) {
+        return false;
+    }
+    for (size_t i = 0; prefix[i] != 0; ++i) {
+        if (s[i] == 0 || towlower(s[i]) != towlower(prefix[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ReadAnchorNameSafe(const void* node, wchar_t* outBuf, size_t maxChars) {
+    outBuf[0] = L'\0';
+    auto* strObj = *reinterpret_cast<uint8_t* const*>(reinterpret_cast<const uint8_t*>(node) + 32);
+    if (!IsValidUserPtr(strObj)) {
+        return false;
+    }
+    const wchar_t* wname = reinterpret_cast<const wchar_t*>(strObj + 24);
+    size_t i = 0;
+    while (i + 1 < maxChars && i < 92 && wname[i] != 0) {
+        outBuf[i] = wname[i];
+        ++i;
+    }
+    outBuf[i] = L'\0';
+    return i > 0;
+}
+
+void EnsureXInputLoaded() {
+    if (g_XInputProbed) {
+        return;
+    }
+    g_XInputProbed = true;
+    const wchar_t* dlls[] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
+    for (const wchar_t* name : dlls) {
+        HMODULE h = GetModuleHandleW(name);
+        if (!h) {
+            h = LoadLibraryW(name);
+        }
+        if (h) {
+            g_FnXInputGetState = reinterpret_cast<FnXInputGetState>(GetProcAddress(h, "XInputGetState"));
+            if (g_FnXInputGetState) {
+                return;
+            }
+        }
+    }
+}
+
+void UpdateDiscretePrompt(const wchar_t* text) {
+    if (!g_Sym.fnIsValid || !g_Sym.fnSetText || !g_Sym.fnSetVisible) {
+        return;
+    }
+    if (!IsValidUserPtr(g_PromptGfxObj) || !g_Sym.fnIsValid(g_PromptGfxObj)) {
+        g_PromptGfxObj = nullptr;
+        g_PromptOwnedByPatch = false;
+        g_LastPromptText[0] = L'\0';
+        return;
+    }
+
+    if (text && text[0] != L'\0') {
+        if (!g_PromptOwnedByPatch || wcscmp(g_LastPromptText, text) != 0) {
+            uint32_t status = 0;
+            g_Sym.fnSetText(g_PromptGfxObj, &status, text);
+            g_Sym.fnSetVisible(g_PromptGfxObj, &status, 1);
+            wcsncpy_s(g_LastPromptText, 128, text, _TRUNCATE);
+            g_PromptOwnedByPatch = true;
+        }
+    } else if (g_PromptOwnedByPatch) {
+        uint32_t status = 0;
+        g_Sym.fnSetText(g_PromptGfxObj, &status, L"");
+        g_Sym.fnSetVisible(g_PromptGfxObj, &status, 0);
+        g_LastPromptText[0] = L'\0';
+        g_PromptOwnedByPatch = false;
+    }
+}
+
+void TogglePreRecordedVideoSkipInGame() {
+    g_Config.skipPreRecordedVideos = !g_Config.skipPreRecordedVideos;
+    if (g_IniPath[0] != L'\0') {
+        WritePrivateProfileStringW(
+            L"Video",
+            L"SkipPreRecordedVideos",
+            g_Config.skipPreRecordedVideos ? L"1" : L"0",
+            g_IniPath);
+    }
+    _snwprintf_s(
+        g_ToggleToastText,
+        128,
+        _TRUNCATE,
+        g_Config.skipPreRecordedVideos
+            ? L"Video Skip: ON  (Press any key during videos)  [F8]"
+            : L"Video Skip: OFF  [F8]");
+    g_ToggleToastUntilTick = GetTickCount() + kToggleToastMs;
+    HookEngine::LogMsg("[LIVE] User toggled SkipPreRecordedVideos=%d via F8",
+                       g_Config.skipPreRecordedVideos ? 1 : 0);
 }
 
 void __fastcall Hook_GetSupportedDisplayModes(void* thisPtr, void* outVec, uint32_t flags) {
@@ -254,7 +441,6 @@ bool NormalizeDisplayAndRenderConfig(uint32_t& outW, uint32_t& outH, float& outA
         return false;
     }
 
-    // Normalize both DisplayViewportInfo slots (dm + 0x20 and dm + 0x70)
     const uint8_t useAlt = *(dm + 0x68);
     uint8_t* primaryVp = dm + (useAlt ? 0x70 : 0x20);
     uint8_t* secondaryVp = dm + (useAlt ? 0x20 : 0x70);
@@ -312,10 +498,404 @@ bool NormalizeDisplayAndRenderConfig(uint32_t& outW, uint32_t& outH, float& outA
     return true;
 }
 
+// Convert any letterboxed/pillarboxed Bink video quad in Mesh2D pool (0x2d1e438)
+// to full-screen Cover-Fit with 1:1 square pixels (zero black bars, zero stretching).
+void FixBinkVideoQuads() {
+    if (!g_Config.fixVideoAspectRatio) {
+        return;
+    }
+    if (g_Sym.mesh2DPoolHeaderPtr && IsValidUserPtr(*g_Sym.mesh2DPoolHeaderPtr)) {
+        uint8_t* poolHdr = *g_Sym.mesh2DPoolHeaderPtr;
+        void** items = *reinterpret_cast<void***>(poolHdr);
+        const uint32_t cap = *reinterpret_cast<const uint32_t*>(poolHdr + 8);
+        if (IsValidUserPtr(items) && cap <= 4096) {
+            for (uint32_t i = 0; i < cap; ++i) {
+                auto* mesh = reinterpret_cast<uint8_t*>(items[i]);
+                if (!IsValidUserPtr(mesh)) {
+                    continue;
+                }
+                const uint32_t vCount = *reinterpret_cast<const uint32_t*>(mesh + 16);
+                if (vCount != 4) {
+                    continue;
+                }
+                const float sortKey = *reinterpret_cast<const float*>(mesh + 76);
+                if (std::fabs(sortKey - 1.0f) > 1e-3f) {
+                    continue;
+                }
+                auto* v = *reinterpret_cast<Mesh2DVertex**>(mesh + 8);
+                if (!IsValidUserPtr(v)) {
+                    continue;
+                }
+                // Match exact BinkQuadSetup (0x1532c90) vertex layout:
+                // v[0]=(x0,y1,1) uv=(0,1), v[1]=(x1,y1,1) uv=(1,1),
+                // v[2]=(x1,y0,1) uv=(1,0), v[3]=(x0,y0,1) uv=(0,0)
+                if (std::fabs(v[0].z - 1.0f) > 1e-3f || std::fabs(v[1].z - 1.0f) > 1e-3f ||
+                    std::fabs(v[2].z - 1.0f) > 1e-3f || std::fabs(v[3].z - 1.0f) > 1e-3f) {
+                    continue;
+                }
+                if (std::fabs(v[0].u - 0.0f) > 1e-3f || std::fabs(v[0].v - 1.0f) > 1e-3f ||
+                    std::fabs(v[1].u - 1.0f) > 1e-3f || std::fabs(v[1].v - 1.0f) > 1e-3f ||
+                    std::fabs(v[2].u - 1.0f) > 1e-3f || std::fabs(v[2].v - 0.0f) > 1e-3f ||
+                    std::fabs(v[3].u - 0.0f) > 1e-3f || std::fabs(v[3].v - 0.0f) > 1e-3f) {
+                    continue;
+                }
+                const float x0 = v[0].x;
+                const float x1 = v[1].x;
+                const float y1 = v[0].y;
+                const float y0 = v[2].y;
+                if (std::fabs(v[3].x - x0) > 1e-3f || std::fabs(v[2].x - x1) > 1e-3f ||
+                    std::fabs(v[1].y - y1) > 1e-3f || std::fabs(v[3].y - y0) > 1e-3f) {
+                    continue;
+                }
+                if (x1 <= x0 + 0.05f || y1 <= y0 + 0.05f) {
+                    continue;
+                }
+
+                const bool isLetterboxed =
+                    std::fabs(x0) < 1e-3f && std::fabs(x1 - 1.0f) < 1e-3f &&
+                    y0 > 0.002f && y1 < 0.998f && std::fabs((y0 + y1) - 1.0f) < 0.02f;
+                const bool isPillarboxed =
+                    std::fabs(y0) < 1e-3f && std::fabs(y1 - 1.0f) < 1e-3f &&
+                    x0 > 0.002f && x1 < 0.998f && std::fabs((x0 + x1) - 1.0f) < 0.02f;
+
+                if (!isLetterboxed && !isPillarboxed) {
+                    continue;
+                }
+
+                float u0 = 0.0f, u1 = 1.0f, v0 = 0.0f, v1 = 1.0f;
+                if (isLetterboxed) {
+                    const float uSpan = std::clamp(y1 - y0, 0.05f, 1.0f);
+                    u0 = 0.5f * (1.0f - uSpan);
+                    u1 = 1.0f - u0;
+                } else {
+                    const float vSpan = std::clamp(x1 - x0, 0.05f, 1.0f);
+                    v0 = 0.5f * (1.0f - vSpan);
+                    v1 = 1.0f - v0;
+                }
+
+                v[0].x = 0.0f; v[0].y = 1.0f; v[0].u = u0; v[0].v = v1;
+                v[1].x = 1.0f; v[1].y = 1.0f; v[1].u = u1; v[1].v = v1;
+                v[2].x = 1.0f; v[2].y = 0.0f; v[2].u = u1; v[2].v = v0;
+                v[3].x = 0.0f; v[3].y = 0.0f; v[3].u = u0; v[3].v = v0;
+
+                HookEngine::LogMsg(
+                    "[LIVE] Bink video Cover-Fit applied (orig=[%.3f,%.3f,%.3f,%.3f] -> uv=[%.3f..%.3f, %.3f..%.3f])",
+                    x0, y0, x1, y1, u0, u1, v0, v1);
+            }
+        }
+    }
+
+    // Secondary 2D video quad pool (0x2d1dc98): clear legacy 16:9 squeeze flag (+0x55) if active
+    if (g_Sym.video2DArrayHeaderPtr && IsValidUserPtr(*g_Sym.video2DArrayHeaderPtr)) {
+        uint8_t* poolHdr = *g_Sym.video2DArrayHeaderPtr;
+        void** items = *reinterpret_cast<void***>(poolHdr);
+        const uint32_t cap = *reinterpret_cast<const uint32_t*>(poolHdr + 8);
+        if (IsValidUserPtr(items) && cap <= 4096) {
+            for (uint32_t i = 0; i < cap; ++i) {
+                auto* q = reinterpret_cast<uint8_t*>(items[i]);
+                if (!IsValidUserPtr(q)) {
+                    continue;
+                }
+                if (*(q + 0x10) != 0 && *(q + 0x55) != 0) {
+                    *(q + 0x55) = 0;
+                    static volatile LONG s_loggedV2D = 0;
+                    if (InterlockedCompareExchange(&s_loggedV2D, 1, 0) == 0) {
+                        HookEngine::LogMsg("[LIVE] Video2D legacy 16:9 aspect squeeze disabled");
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool CheckSkippableBinkResource(
+    uint8_t* binkRes,
+    uint8_t*& outHbink,
+    uint32_t& outFrames,
+    uint32_t& outFrameNum) {
+    if (!IsValidUserPtr(binkRes)) {
+        return false;
+    }
+    if (g_Sym.binkResourceVTable &&
+        *reinterpret_cast<const void* const*>(binkRes) != g_Sym.binkResourceVTable) {
+        return false;
+    }
+    uint8_t* hbink = *reinterpret_cast<uint8_t**>(binkRes + 32);
+    const uint8_t isLooping = *(binkRes + 51);
+    if (!IsValidUserPtr(hbink) || isLooping != 0) {
+        return false;
+    }
+    const uint32_t openFlags = *reinterpret_cast<const uint32_t*>(hbink + 0x20);
+    if ((openFlags & 0x80U) != 0) {  // BINKWILLLOOP
+        return false;
+    }
+    const uint32_t fTotal = *reinterpret_cast<const uint32_t*>(hbink + 8);
+    const uint32_t fCur = *reinterpret_cast<const uint32_t*>(hbink + 12);
+    if (fTotal <= 1 || fTotal >= 1000000 || fCur >= fTotal) {
+        return false;
+    }
+    outHbink = hbink;
+    outFrames = fTotal;
+    outFrameNum = fCur;
+    return true;
+}
+
+// Detect active non-looping pre-recorded Bink video (both in-game cutscenes via BinkPlayerMgr
+// and startup intro videos via Mesh2DPool), show discrete prompt, and skip on any button/key.
+void UpdatePreRecordedVideoSkip() {
+    const DWORD now = GetTickCount();
+
+    uint8_t* activeBinkRes = nullptr;
+    uint8_t* activeHbink = nullptr;
+    uint32_t frames = 0;
+    uint32_t frameNum = 0;
+
+    // Source 1: BinkPlayerMgr (in-game story cutscenes / mission videos)
+    if (g_Sym.binkPlayerMgrPtr && IsValidUserPtr(*g_Sym.binkPlayerMgrPtr)) {
+        uint8_t* mgr = *g_Sym.binkPlayerMgrPtr;
+        uint8_t* binkPlayer = *reinterpret_cast<uint8_t**>(mgr + 8);
+        if (IsValidUserPtr(binkPlayer)) {
+            uint8_t* binkRes = *reinterpret_cast<uint8_t**>(binkPlayer + 16);
+            if (CheckSkippableBinkResource(binkRes, activeHbink, frames, frameNum)) {
+                activeBinkRes = binkRes;
+            }
+        }
+    }
+
+    // Source 2: Mesh2DPool (startup intro videos via Initial Screens & fullscreen Bink quads)
+    if (!activeBinkRes && g_Sym.mesh2DPoolHeaderPtr && IsValidUserPtr(*g_Sym.mesh2DPoolHeaderPtr)) {
+        uint8_t* poolHdr = *g_Sym.mesh2DPoolHeaderPtr;
+        void** items = *reinterpret_cast<void***>(poolHdr);
+        const uint32_t cap = *reinterpret_cast<const uint32_t*>(poolHdr + 8);
+        if (IsValidUserPtr(items) && cap <= 4096) {
+            for (uint32_t i = 0; i < cap; ++i) {
+                auto* mesh = reinterpret_cast<uint8_t*>(items[i]);
+                if (!IsValidUserPtr(mesh)) {
+                    continue;
+                }
+                if (*(mesh + 81) == 0) {  // not visible
+                    continue;
+                }
+                const uint32_t vCount = *reinterpret_cast<const uint32_t*>(mesh + 16);
+                const uint32_t gCount = *reinterpret_cast<const uint32_t*>(mesh + 48);
+                if (vCount != 4 || gCount == 0 || gCount > 16) {
+                    continue;
+                }
+                uint8_t* groups = *reinterpret_cast<uint8_t**>(mesh + 40);
+                if (!IsValidUserPtr(groups)) {
+                    continue;
+                }
+                uint8_t* binkRes = *reinterpret_cast<uint8_t**>(groups + 40);
+                if (CheckSkippableBinkResource(binkRes, activeHbink, frames, frameNum)) {
+                    activeBinkRes = binkRes;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (activeBinkRes != g_ActiveSkippableBinkRes) {
+        g_ActiveSkippableBinkRes = activeBinkRes;
+        g_ActiveBinkStartTick = now;
+        InterlockedExchange(&g_PendingSkipRequest, 0);
+        if (activeBinkRes) {
+            HookEngine::LogMsg("[LIVE] Skippable pre-recorded Bink video detected (frames=%u, skip=%d)",
+                               frames, g_Config.skipPreRecordedVideos ? 1 : 0);
+        }
+    }
+
+    // Poll XInput gamepad buttons only while a skippable video is active
+    bool padSkipPressed = false;
+    if (activeBinkRes && g_Config.skipPreRecordedVideos) {
+        EnsureXInputLoaded();
+        if (g_FnXInputGetState) {
+            for (DWORD u = 0; u < 4; ++u) {
+                XInputState st{};
+                if (g_FnXInputGetState(u, &st) == ERROR_SUCCESS) {
+                    const WORD newlyPressed = static_cast<WORD>(st.Gamepad.wButtons & ~g_PrevPadButtons[u]);
+                    g_PrevPadButtons[u] = st.Gamepad.wButtons;
+                    if (newlyPressed != 0) {
+                        padSkipPressed = true;
+                    }
+                } else {
+                    g_PrevPadButtons[u] = 0;
+                }
+            }
+        }
+    } else {
+        memset(g_PrevPadButtons, 0, sizeof(g_PrevPadButtons));
+    }
+
+    const bool keyOrMouseSkip = (InterlockedExchange(&g_PendingSkipRequest, 0) != 0);
+    if (activeBinkRes && activeHbink && g_Config.skipPreRecordedVideos &&
+        (keyOrMouseSkip || padSkipPressed) &&
+        (now - g_ActiveBinkStartTick) >= kVideoSkipGraceMs) {
+        // Advance both CBinkResource playedFrames (> startFrame and >= frames) and HBINK->FrameNum
+        // so native CBinkResource::IsFinished() (0x151950) cleanly ends playback on the next tick.
+        const uint32_t startFrame = *reinterpret_cast<const uint32_t*>(activeBinkRes + 80);
+        *reinterpret_cast<uint32_t*>(activeBinkRes + 84) = std::max(frames, startFrame + 1U);
+        *reinterpret_cast<uint32_t*>(activeHbink + 12) = frames;
+        HookEngine::LogMsg("[LIVE] Pre-recorded Bink video skipped by user input (frame %u/%u)",
+                           frameNum, frames);
+        g_ActiveSkippableBinkRes = nullptr;
+        UpdateDiscretePrompt(nullptr);
+        return;
+    }
+
+    // Discrete native on-screen feedback (F8 toggle toast OR subtle skip hint during videos)
+    if (g_ToggleToastUntilTick != 0 && static_cast<int32_t>(g_ToggleToastUntilTick - now) > 0) {
+        UpdateDiscretePrompt(g_ToggleToastText);
+    } else {
+        g_ToggleToastUntilTick = 0;
+        if (activeBinkRes && g_Config.showSkipPrompt) {
+            UpdateDiscretePrompt(
+                g_Config.skipPreRecordedVideos
+                    ? L"[Any Key] Skip Video   |   [F8] Disable"
+                    : L"[F8] Enable Video Skip");
+        } else {
+            UpdateDiscretePrompt(nullptr);
+        }
+    }
+}
+
+bool ContainsCaseInsensitiveA(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !*needle) {
+        return false;
+    }
+    const size_t nlen = strlen(needle);
+    for (size_t i = 0; i < 128 && haystack[i] != '\0'; ++i) {
+        size_t j = 0;
+        while (j < nlen && haystack[i + j] != '\0' &&
+               std::tolower(static_cast<unsigned char>(haystack[i + j])) ==
+                   std::tolower(static_cast<unsigned char>(needle[j]))) {
+            ++j;
+        }
+        if (j == nlen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* ReadMovieNameSafe(uint8_t* mov) {
+    if (!IsValidUserPtr(mov)) {
+        return "";
+    }
+    uint8_t* wrapper = *reinterpret_cast<uint8_t**>(mov + 8);
+    if (!IsValidUserPtr(wrapper)) {
+        return "";
+    }
+    void** vt = *reinterpret_cast<void***>(wrapper);
+    if (!IsValidUserPtr(vt) || !IsValidUserPtr(vt[1])) {
+        return "";
+    }
+    using FnGetName = const char*(__fastcall*)(void*);
+    const char* name = reinterpret_cast<FnGetName>(vt[1])(wrapper);
+    return IsValidUserPtr(name) ? name : "";
+}
+
+void HideSpriteNodeClean(uint8_t* node) {
+    if (!IsValidUserPtr(node) || !g_Sym.fnSpriteNodeSetVis || !g_Sym.fnSpriteNodeInval) {
+        return;
+    }
+    const bool visible = ((*(node + 292) >> 3) & 1) != 0;
+    if (!visible) {
+        return;
+    }
+    // Verify internal movie/stage pointers accessed by SpriteNode::SetVisible & Invalidate
+    uint8_t* m192 = *reinterpret_cast<uint8_t**>(node + 192);
+    uint8_t* m152 = *reinterpret_cast<uint8_t**>(node + 152);
+    if (!IsValidUserPtr(m192) || !IsValidUserPtr(m152)) {
+        return;
+    }
+    uint8_t* m136 = *reinterpret_cast<uint8_t**>(m192 + 136);
+    if (!IsValidUserPtr(m136) || !IsValidUserPtr(*reinterpret_cast<uint8_t**>(m136 + 1584))) {
+        return;
+    }
+    g_Sym.fnSpriteNodeSetVis(node, 0);
+    g_Sym.fnSpriteNodeInval(node);
+    *reinterpret_cast<uint32_t*>(node + 100) |= 1U;
+}
+
+// Recursively locate and hide Ubisoft's baked 16:9 letterbox bars placed outside 1280x720
+// (e.g. PauseRoot tabBar & WorldMap mcVignetteContainer 1280x200 bars at y=-199 / y=+719,
+// and WeaponWheel 6000x500 bars at y=+720). Returns count of baked bar nodes hidden.
+uint32_t SweepBakedBlackBarsRecursive(
+    uint8_t* parentNode,
+    uint32_t depth,
+    uint32_t& budget,
+    bool hideDirectParentOfBars) {
+    if (!IsValidUserPtr(parentNode) || depth > 3 || budget == 0) {
+        return 0;
+    }
+    uint8_t* child = *reinterpret_cast<uint8_t**>(parentNode + 176);  // firstChild
+    uint32_t hiddenHere = 0;
+    uint32_t matchedDirectBars = 0;
+
+    while (IsValidUserPtr(child) && budget > 0) {
+        --budget;
+        const double sx = std::fabs(static_cast<double>(ReadI32(child + 56)) / 65536.0);
+        const double sy = std::fabs(static_cast<double>(ReadI32(child + 68)) / 65536.0);
+        const double ty = static_cast<double>(ReadI32(child + 76)) / 20.0;
+
+        // Exact signature of baked letterbox bar sprites:
+        // scaleX >= 20x (>=640px wide), scaleY >= 5x (>=160px tall), placed outside y=0..720 stage.
+        const bool isBakedBar = (sx >= 20.0 && sy >= 5.0 && (ty <= -150.0 || ty >= 710.0));
+        if (isBakedBar) {
+            ++matchedDirectBars;
+            if (((*(child + 292) >> 3) & 1) != 0) {
+                HideSpriteNodeClean(child);
+                ++hiddenHere;
+            }
+        } else if (depth < 3) {
+            hiddenHere += SweepBakedBlackBarsRecursive(child, depth + 1, budget, hideDirectParentOfBars);
+        }
+        child = *reinterpret_cast<uint8_t**>(child + 168);  // nextSibling
+    }
+
+    // On WorldMap's lyt_mcFrontUI, hide mcVignetteContainer (depth >= 1) once its baked bars are matched
+    // so the 16:9 rectangular vignette border does not frame non-16:9 screens.
+    if (hideDirectParentOfBars && depth >= 1 && matchedDirectBars >= 2) {
+        if (((*(parentNode + 292) >> 3) & 1) != 0) {
+            HideSpriteNodeClean(parentNode);
+            ++hiddenHere;
+        }
+    }
+    return hiddenHere;
+}
+
+void SweepBakedBlackBarsOnGfxObj(void* gfxObj, bool hideDirectParentOfBars) {
+    if (!g_Config.disableBlackBars || !IsValidUserPtr(gfxObj) ||
+        !g_Sym.fnSpriteNodeSetVis || !g_Sym.fnSpriteNodeInval) {
+        return;
+    }
+    uint8_t* handle = *reinterpret_cast<uint8_t**>(gfxObj);
+    if (!IsValidUserPtr(handle)) {
+        return;
+    }
+    uint8_t* asObj = *reinterpret_cast<uint8_t**>(handle + 48);
+    if (!IsValidUserPtr(asObj) || !IsValidUserPtr(*reinterpret_cast<uint8_t**>(asObj + 136))) {
+        return;
+    }
+    uint8_t* spriteNode = *reinterpret_cast<uint8_t**>(asObj + 176);
+    if (!IsValidUserPtr(spriteNode)) {
+        return;
+    }
+    uint32_t budget = 192;
+    const uint32_t hidden = SweepBakedBlackBarsRecursive(spriteNode, 0, budget, hideDirectParentOfBars);
+    if (hidden > 0) {
+        static volatile LONG s_loggedBaked = 0;
+        if (InterlockedIncrement(&s_loggedBaked) <= 6) {
+            HookEngine::LogMsg("[LIVE] Baked 16:9 Flash black-bar child nodes suppressed (count=%u, hideContainer=%d)",
+                               hidden, hideDirectParentOfBars ? 1 : 0);
+        }
+    }
+}
+
 void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
-    if (!g_Config.adaptiveUi || !g_Sym.uiMovieMgrPtr || !g_Sym.fnTreeNext ||
-        !g_Sym.fnIsValid || !g_Sym.fnSetXScale || !g_Sym.fnSetYScale ||
-        !g_Sym.fnSetX || !g_Sym.fnSetY) {
+    if ((!g_Config.adaptiveUi && !g_Config.disableBlackBars && !g_Config.disableCinematicBlackBars) ||
+        !g_Sym.uiMovieMgrPtr || !g_Sym.fnTreeNext || !g_Sym.fnIsValid ||
+        !g_Sym.fnSetXScale || !g_Sym.fnSetYScale || !g_Sym.fnSetX || !g_Sym.fnSetY) {
         return;
     }
     uint8_t* mgr = *g_Sym.uiMovieMgrPtr;
@@ -371,6 +951,9 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
             continue;
         }
 
+        const char* movieName = ReadMovieNameSafe(mov);
+        const bool isPressStartMovie = ContainsCaseInsensitiveA(movieName, "PressStart");
+
         void* node = *reinterpret_cast<void**>(treeHead);
         uint32_t visited = 0;
         while (IsValidUserPtr(node) && node != treeHead && visited < anchorCount + 8) {
@@ -381,6 +964,21 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                 if (IsValidUserPtr(gfxWrap)) {
                     void* gfxObj = *reinterpret_cast<void**>(gfxWrap + 0x10);
                     if (IsValidUserPtr(gfxObj) && g_Sym.fnIsValid(gfxObj)) {
+                        wchar_t aName[96]{};
+                        ReadAnchorNameSafe(node, aName, 96);
+
+                        // Capture native SubTitleText2 for discrete video-skip hint / F8 toggle toast
+                        if (EqualsCaseInsensitiveW(aName, L"SubTitleText2")) {
+                            g_PromptGfxObj = gfxObj;
+                        }
+
+                        // Sweep baked 1280x200 / 6000x500 letterbox child sprites inside tabBar,
+                        // WorldMap mcFrontUI->mcVignetteContainer, WeaponWheel, etc.
+                        const bool isWorldMapFront = EqualsCaseInsensitiveW(aName, L"lyt_mcFrontUI");
+                        if (g_Config.disableBlackBars) {
+                            SweepBakedBlackBarsOnGfxObj(gfxObj, isWorldMapFront);
+                        }
+
                         const double elemX = *reinterpret_cast<const double*>(obj + 0x10);
                         const double elemY = *reinterpret_cast<const double*>(obj + 0x18);
                         const double curCachedW = *reinterpret_cast<const double*>(obj + 0x20);
@@ -390,6 +988,48 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                         const int32_t align = *reinterpret_cast<const int32_t*>(obj + 0x38);
                         const int32_t bScaleX = *reinterpret_cast<const int32_t*>(obj + 0x3c);
                         const int32_t bScaleY = *reinterpret_cast<const int32_t*>(obj + 0x40);
+
+                        const bool isOriginTopLeft = (std::fabs(elemX) < 1.0 && std::fabs(elemY) < 1.0);
+                        const bool isOriginCenter = (std::fabs(elemX - 640.0) < 2.0 && std::fabs(elemY - 360.0) < 2.0);
+                        const bool isLytAnchor = StartsWithCaseInsensitiveW(aName, L"lyt_");
+
+                        // Classify special UI clips:
+                        // 1 = hide black-bar clip (staticBlackBars / BlackBarsMC)
+                        // 2 = full-bleed background Cover-Fit (Main Menu Elephant, Pause/Shop nebula,
+                        //     Loading Screen, World Map default BG, Press Any Key)
+                        // 3 = centered 1280x720 menu stage container (Pause, Shop, Skills, MainMenu, etc.)
+                        uint8_t specialKind = 0;
+                        if ((g_Config.disableBlackBars && EqualsCaseInsensitiveW(aName, L"staticBlackBars")) ||
+                            (g_Config.disableCinematicBlackBars && EqualsCaseInsensitiveW(aName, L"BlackBarsMC")) ||
+                            (g_Config.disableBlackBars && ContainsCaseInsensitiveW(aName, L"blackbar"))) {
+                            specialKind = 1;
+                        } else if (g_Config.adaptiveUi && isLytAnchor && (isOriginTopLeft || isOriginCenter) &&
+                                   (EqualsCaseInsensitiveW(aName, L"lyt_mcMainMenuBG") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcBack") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcBG") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcDefaultBG") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcBackground") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcBackgroundOpaque") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcBlackBG") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_mcPowderBack") ||
+                                    EqualsCaseInsensitiveW(aName, L"lyt_art") ||
+                                    StartsWithCaseInsensitiveW(aName, L"lyt_bg") ||
+                                    ContainsCaseInsensitiveW(aName, L"background") ||
+                                    (isPressStartMovie && EqualsCaseInsensitiveW(aName, L"lyt_page")))) {
+                            specialKind = 2;
+                        } else if (g_Config.adaptiveUi &&
+                                   isLytAnchor && anchorCount <= 12 &&
+                                   (mode == 2 || mode == 3) && align == 0 && isOriginTopLeft &&
+                                   !EqualsCaseInsensitiveW(aName, L"lyt_tabBar") &&
+                                   !isWorldMapFront &&
+                                   !ContainsCaseInsensitiveW(aName, L"HUD")) {
+                            specialKind = 3;
+                        }
+
+                        if (!g_Config.adaptiveUi && specialKind != 1) {
+                            node = g_Sym.fnTreeNext(node);
+                            continue;
+                        }
 
                         UiLayoutIO io{};
                         io.vpW = vpW;
@@ -409,6 +1049,7 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                         if (!needsApply) {
                             const AnchorCacheEntry& c = it->second;
                             if (c.gfxObj != gfxObj ||
+                                c.specialKind != specialKind ||
                                 std::fabs(c.vpW - vpW) > 0.5 ||
                                 std::fabs(c.vpH - vpH) > 0.5 ||
                                 std::fabs(c.safeL - safeL) > 0.5 ||
@@ -426,50 +1067,122 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             }
                         }
 
+                        // Always re-hide black-bar clips in case ActionScript toggled visibility back on
+                        if (specialKind == 1 && g_Sym.fnSetVisible) {
+                            uint32_t visStatus = 0;
+                            g_Sym.fnSetVisible(gfxObj, &visStatus, 0);
+                        }
+
                         if (needsApply) {
                             *reinterpret_cast<double*>(obj + 0x20) = markedW;
                             *reinterpret_cast<double*>(obj + 0x28) = markedH;
 
                             uint32_t status = 0;
-                            if (scaleFlags == 2 || scaleFlags == 3) {
-                                g_Sym.fnSetXScale(gfxObj, &status, io.scaleX);
-                            }
-                            if (scaleFlags == 1 || scaleFlags == 3) {
-                                g_Sym.fnSetYScale(gfxObj, &status, io.scaleY);
-                            }
-
-                            const double posScaleX = (bScaleX != 0) ? io.scaleX : 1.0;
-                            const double posScaleY = (bScaleY != 0) ? io.scaleY : 1.0;
-
-                            if (align >= 0 && align <= 8) {
-                                double outX = elemX;
-                                switch (align % 3) {
-                                    case 0:  // LEFT
-                                        outX = io.safeL + posScaleX * elemX;
-                                        break;
-                                    case 1:  // CENTER
-                                        outX = io.safeL + 0.5 * io.cachedW - posScaleX * (640.0 - elemX);
-                                        break;
-                                    case 2:  // RIGHT
-                                        outX = io.safeR - posScaleX * (1280.0 - elemX);
-                                        break;
+                            if (specialKind == 1) {
+                                if (g_Sym.fnSetVisible) {
+                                    g_Sym.fnSetVisible(gfxObj, &status, 0);
                                 }
+                                g_Sym.fnSetXScale(gfxObj, &status, 0.0);
+                                g_Sym.fnSetYScale(gfxObj, &status, 0.0);
+                                g_Sym.fnSetX(gfxObj, &status, -10000.0);
+                                g_Sym.fnSetY(gfxObj, &status, -10000.0);
 
-                                double outY = elemY;
-                                switch (align / 3) {
-                                    case 0:  // TOP
-                                        outY = io.safeT + posScaleY * elemY;
-                                        break;
-                                    case 1:  // MIDDLE
-                                        outY = io.safeT + 0.5 * io.cachedH - posScaleY * (360.0 - elemY);
-                                        break;
-                                    case 2:  // BOTTOM
-                                        outY = io.safeB - posScaleY * (720.0 - elemY);
-                                        break;
+                                static volatile LONG s_loggedBB = 0;
+                                if (InterlockedCompareExchange(&s_loggedBB, 1, 0) == 0) {
+                                    HookEngine::LogMsg("[LIVE] Flash BlackBars clip suppressed directly");
                                 }
-
+                            } else if (specialKind == 2) {
+                                // Full-bleed aspect-preserving Cover-Fit (origin-invariant for both (0,0) and (640,360))
+                                const double coverScale = std::max(vpW / 1280.0, vpH / 720.0);
+                                const double outX = 0.5 * vpW - coverScale * (640.0 - elemX);
+                                const double outY = 0.5 * vpH - coverScale * (360.0 - elemY);
+                                g_Sym.fnSetXScale(gfxObj, &status, coverScale);
+                                g_Sym.fnSetYScale(gfxObj, &status, coverScale);
                                 g_Sym.fnSetX(gfxObj, &status, outX);
                                 g_Sym.fnSetY(gfxObj, &status, outY);
+
+                                static volatile LONG s_loggedBg = 0;
+                                if (InterlockedIncrement(&s_loggedBg) <= 6) {
+                                    char aBuf[64]{};
+                                    size_t k = 0;
+                                    for (; k + 1 < sizeof(aBuf) && aName[k] != 0; ++k) {
+                                        aBuf[k] = (aName[k] >= 0x20 && aName[k] <= 0x7E) ? static_cast<char>(aName[k]) : '?';
+                                    }
+                                    HookEngine::LogMsg(
+                                        "[LIVE] Menu background Cover-Fit applied '%s' (vp=%.0fx%.0f scale=%.4f pos=(%.1f,%.1f))",
+                                        aBuf, vpW, vpH, coverScale, outX, outY);
+                                }
+                            } else if (specialKind == 3) {
+                                // Center full-stage 1280x720 menu container cleanly over Cover-Fit backdrop
+                                const double uScale = std::min(vpW / 1280.0, vpH / 720.0);
+                                const double outX = 0.5 * (vpW - 1280.0 * uScale);
+                                const double outY = 0.5 * (vpH - 720.0 * uScale);
+                                g_Sym.fnSetXScale(gfxObj, &status, uScale);
+                                g_Sym.fnSetYScale(gfxObj, &status, uScale);
+                                g_Sym.fnSetX(gfxObj, &status, outX);
+                                g_Sym.fnSetY(gfxObj, &status, outY);
+
+                                static volatile LONG s_loggedPage = 0;
+                                if (InterlockedIncrement(&s_loggedPage) <= 6) {
+                                    char aBuf[64]{};
+                                    size_t k = 0;
+                                    for (; k + 1 < sizeof(aBuf) && aName[k] != 0; ++k) {
+                                        aBuf[k] = (aName[k] >= 0x20 && aName[k] <= 0x7E) ? static_cast<char>(aName[k]) : '?';
+                                    }
+                                    HookEngine::LogMsg(
+                                        "[LIVE] Menu stage centered '%s' (vp=%.0fx%.0f scale=%.4f pos=(%.1f,%.1f))",
+                                        aBuf, vpW, vpH, uScale, outX, outY);
+                                }
+                            } else {
+                                if (scaleFlags == 2 || scaleFlags == 3) {
+                                    g_Sym.fnSetXScale(gfxObj, &status, io.scaleX);
+                                }
+                                if (scaleFlags == 1 || scaleFlags == 3) {
+                                    g_Sym.fnSetYScale(gfxObj, &status, io.scaleY);
+                                }
+
+                                const double posScaleX = (bScaleX != 0) ? io.scaleX : 1.0;
+                                const double posScaleY = (bScaleY != 0) ? io.scaleY : 1.0;
+
+                                if (align >= 0 && align <= 8) {
+                                    double outX = elemX;
+                                    switch (align % 3) {
+                                        case 0:  // LEFT
+                                            outX = io.safeL + posScaleX * elemX;
+                                            break;
+                                        case 1:  // CENTER
+                                            outX = io.safeL + 0.5 * io.cachedW - posScaleX * (640.0 - elemX);
+                                            break;
+                                        case 2:  // RIGHT
+                                            outX = io.safeR - posScaleX * (1280.0 - elemX);
+                                            break;
+                                    }
+
+                                    double outY = elemY;
+                                    switch (align / 3) {
+                                        case 0:  // TOP
+                                            outY = io.safeT + posScaleY * elemY;
+                                            break;
+                                        case 1:  // MIDDLE
+                                            outY = io.safeT + 0.5 * io.cachedH - posScaleY * (360.0 - elemY);
+                                            break;
+                                        case 2:  // BOTTOM
+                                            outY = io.safeB - posScaleY * (720.0 - elemY);
+                                            break;
+                                    }
+
+                                    g_Sym.fnSetX(gfxObj, &status, outX);
+                                    g_Sym.fnSetY(gfxObj, &status, outY);
+                                }
+
+                                static volatile LONG s_loggedModeMask = 0;
+                                const LONG bit = (mode >= 0 && mode <= 5) ? (1L << mode) : (1L << 6);
+                                if ((InterlockedOr(&s_loggedModeMask, bit) & bit) == 0) {
+                                    HookEngine::LogMsg(
+                                        "[LIVE] AdaptiveUI applied (vp=%.0fx%.0f mode=%d scale=%.4fx%.4f bounds=[%.0f,%.0f,%.0f,%.0f])",
+                                        vpW, vpH, mode, io.scaleX, io.scaleY,
+                                        io.safeL, io.safeT, io.safeR, io.safeB);
+                                }
                             }
 
                             AnchorCacheEntry entry{};
@@ -487,16 +1200,8 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             entry.scaleFlags = scaleFlags;
                             entry.bScaleX = bScaleX;
                             entry.bScaleY = bScaleY;
+                            entry.specialKind = specialKind;
                             g_AnchorCache[obj] = entry;
-
-                            static volatile LONG s_loggedModeMask = 0;
-                            const LONG bit = (mode >= 0 && mode <= 5) ? (1L << mode) : (1L << 6);
-                            if ((InterlockedOr(&s_loggedModeMask, bit) & bit) == 0) {
-                                HookEngine::LogMsg(
-                                    "[LIVE] AdaptiveUI applied (vp=%.0fx%.0f mode=%d scale=%.4fx%.4f bounds=[%.0f,%.0f,%.0f,%.0f])",
-                                    vpW, vpH, mode, io.scaleX, io.scaleY,
-                                    io.safeL, io.safeT, io.safeR, io.safeB);
-                            }
                         }
                     }
                 }
@@ -506,13 +1211,65 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
     }
 }
 
+bool IsIgnoredSkipKey(WPARAM vk) {
+    switch (vk) {
+        case VK_F8:
+        case VK_SHIFT:
+        case VK_LSHIFT:
+        case VK_RSHIFT:
+        case VK_CONTROL:
+        case VK_LCONTROL:
+        case VK_RCONTROL:
+        case VK_MENU:
+        case VK_LMENU:
+        case VK_RMENU:
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_CAPITAL:
+        case VK_NUMLOCK:
+        case VK_SCROLL:
+        case VK_SNAPSHOT:
+        case VK_F12:
+            return true;
+        default:
+            return false;
+    }
+}
+
 LRESULT CALLBACK Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == kMsgStartTimer) {
+        SetTimer(hWnd, kAdaptiveTimerId, kAdaptiveTimerMs, nullptr);
+        TickAdaptiveEngineOnMainThread();
+        return 0;
+    }
     if (msg == WM_TIMER && wParam == kAdaptiveTimerId) {
+        static volatile LONG s_loggedTimer = 0;
+        if (InterlockedCompareExchange(&s_loggedTimer, 1, 0) == 0) {
+            HookEngine::LogMsg("[LIVE] Main-thread WM_TIMER heartbeat active (HWND=0x%p)", hWnd);
+        }
         TickAdaptiveEngineOnMainThread();
         return 0;
     }
     if (msg == WM_SIZE || msg == WM_DISPLAYCHANGE || msg == WM_ACTIVATEAPP) {
         TickAdaptiveEngineOnMainThread();
+    }
+
+    // Discrete in-game F8 toggle & any-button pre-recorded video skip
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+        const bool isRepeat = (lParam & (1LL << 30)) != 0;
+        if (!isRepeat) {
+            if (wParam == VK_F8) {
+                TogglePreRecordedVideoSkipInGame();
+            } else if (g_ActiveSkippableBinkRes != nullptr &&
+                       g_Config.skipPreRecordedVideos &&
+                       !IsIgnoredSkipKey(wParam)) {
+                InterlockedExchange(&g_PendingSkipRequest, 1);
+            }
+        }
+    } else if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+        if (g_ActiveSkippableBinkRes != nullptr && g_Config.skipPreRecordedVideos) {
+            InterlockedExchange(&g_PendingSkipRequest, 1);
+        }
     }
 
     WNDPROC orig = reinterpret_cast<WNDPROC>(
@@ -566,7 +1323,7 @@ BOOL CALLBACK EnumGameWindowsProc(HWND hWnd, LPARAM lParam) {
     SendMessageTimeoutW(
         hWnd, WM_GETTEXT, 128, reinterpret_cast<LPARAM>(title),
         SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &textRes);
-    const bool titleMatch = (wcsstr(title, L"Far Cry") != nullptr);
+    const bool titleMatch = (wcsstr(title, L"Far Cry") != nullptr || wcsstr(title, L"FarCry") != nullptr);
     const int64_t area = w * h;
 
     if (!ctx->bestHwnd ||
@@ -597,16 +1354,18 @@ DWORD WINAPI WindowAttachThreadProc(LPVOID) {
         EnumWindows(EnumGameWindowsProc, reinterpret_cast<LPARAM>(&ctx));
 
         if (ctx.bestHwnd && ctx.bestHwnd != curWnd) {
-            // Read window title BEFORE subclassing (avoid cross-thread SendMessage after swap)
             wchar_t title[128]{};
             DWORD_PTR textRes = 0;
             SendMessageTimeoutW(
                 ctx.bestHwnd, WM_GETTEXT, 128, reinterpret_cast<LPARAM>(title),
                 SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &textRes);
-            char titleAnsi[128]{};
-            WideCharToMultiByte(CP_ACP, 0, title, -1, titleAnsi, sizeof(titleAnsi), nullptr, nullptr);
+            char titleAscii[128]{};
+            size_t ti = 0;
+            for (size_t i = 0; title[i] != 0 && ti + 1 < sizeof(titleAscii); ++i) {
+                titleAscii[ti++] = (title[i] >= 0x20 && title[i] <= 0x7E) ? static_cast<char>(title[i]) : ' ';
+            }
+            titleAscii[ti] = '\0';
 
-            // Restore previous window if switching from splash to main D3D11 window
             WNDPROC prevOrig = reinterpret_cast<WNDPROC>(
                 InterlockedCompareExchangePointer(reinterpret_cast<PVOID volatile*>(&g_OrigWndProc), nullptr, nullptr));
             if (curWnd && IsWindow(curWnd) && prevOrig && prevOrig != &Hook_WndProc) {
@@ -614,7 +1373,6 @@ DWORD WINAPI WindowAttachThreadProc(LPVOID) {
                 SetWindowLongPtrW(curWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(prevOrig));
             }
 
-            // Store original WNDPROC atomically BEFORE swapping so Hook_WndProc always sees it immediately
             WNDPROC targetOrig = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ctx.bestHwnd, GWLP_WNDPROC));
             if (targetOrig && targetOrig != &Hook_WndProc) {
                 InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&g_OrigWndProc),
@@ -622,9 +1380,9 @@ DWORD WINAPI WindowAttachThreadProc(LPVOID) {
                 InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&g_SubclassedWnd),
                                            reinterpret_cast<PVOID>(ctx.bestHwnd));
                 SetWindowLongPtrW(ctx.bestHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&Hook_WndProc));
-                SetTimer(ctx.bestHwnd, kAdaptiveTimerId, kAdaptiveTimerMs, nullptr);
+                PostMessageW(ctx.bestHwnd, kMsgStartTimer, 0, 0);
                 HookEngine::LogMsg("[LIVE] Attached main-thread adaptive timer to HWND=0x%p ('%s')",
-                                   ctx.bestHwnd, titleAnsi);
+                                   ctx.bestHwnd, titleAscii);
             }
         }
 
@@ -633,23 +1391,112 @@ DWORD WINAPI WindowAttachThreadProc(LPVOID) {
     return 0;
 }
 
+void DumpDiagnosticsIfEnabled() {
+    if (!g_Config.diagnosticLog || !g_Sym.hFC64) {
+        return;
+    }
+    static uint32_t s_tick = 0;
+    ++s_tick;
+    if (s_tick != 1 && (s_tick % 90) != 0) {
+        return;
+    }
+    if (s_tick > 1800) {
+        return;
+    }
+
+    if (g_Sym.uiMovieMgrPtr && IsValidUserPtr(*g_Sym.uiMovieMgrPtr)) {
+        uint8_t* mgr = *g_Sym.uiMovieMgrPtr;
+        const uint32_t movieCount = *reinterpret_cast<const uint32_t*>(mgr + 16);
+        void** movieItems = *reinterpret_cast<void***>(mgr + 8);
+        HookEngine::LogMsg("[DIAG] tick=%u movies=%u", s_tick, movieCount);
+        if (IsValidUserPtr(movieItems) && movieCount <= 128) {
+            for (uint32_t m = 0; m < movieCount; ++m) {
+                auto* mov = reinterpret_cast<uint8_t*>(movieItems[m]);
+                if (!IsValidUserPtr(mov)) continue;
+                const char* mName = "?";
+                uint8_t* wrapper = *reinterpret_cast<uint8_t**>(mov + 8);
+                uint16_t st172 = 0, st174 = 0, st176 = 0, st178 = 0;
+                if (IsValidUserPtr(wrapper)) {
+                    void** vt = *reinterpret_cast<void***>(wrapper);
+                    if (IsValidUserPtr(vt) && IsValidUserPtr(vt[1])) {
+                        using FnGetName = const char*(__fastcall*)(void*);
+                        const char* n = reinterpret_cast<FnGetName>(vt[1])(wrapper);
+                        if (IsValidUserPtr(n)) mName = n;
+                    }
+                    uint8_t* inner = *reinterpret_cast<uint8_t**>(wrapper + 8);
+                    if (IsValidUserPtr(inner)) {
+                        uint8_t* gfxMov = *reinterpret_cast<uint8_t**>(inner + 160);
+                        if (IsValidUserPtr(gfxMov)) {
+                            st172 = *reinterpret_cast<const uint16_t*>(gfxMov + 172);
+                            st174 = *reinterpret_cast<const uint16_t*>(gfxMov + 174);
+                            st176 = *reinterpret_cast<const uint16_t*>(gfxMov + 176);
+                            st178 = *reinterpret_cast<const uint16_t*>(gfxMov + 178);
+                        }
+                    }
+                }
+                uint8_t* anchorMgr = *reinterpret_cast<uint8_t**>(mov + 24);
+                uint32_t anchorCount = 0;
+                if (IsValidUserPtr(anchorMgr)) {
+                    anchorCount = *reinterpret_cast<const uint32_t*>(anchorMgr + 24 + 32);
+                }
+                HookEngine::LogMsg("[DIAG]  Movie[%u] '%s' stage=%ux%u vp=%ux%u anchors=%u",
+                                   m, mName, st174, st172, st178, st176, anchorCount);
+                if (IsValidUserPtr(anchorMgr) && anchorCount > 0 && anchorCount <= 128 && g_Sym.fnTreeNext) {
+                    uint8_t* treeHead = anchorMgr + 24;
+                    void* node = *reinterpret_cast<void**>(treeHead);
+                    uint32_t vis = 0;
+                    while (IsValidUserPtr(node) && node != treeHead && vis < anchorCount + 4) {
+                        ++vis;
+                        wchar_t wName[96]{};
+                        ReadAnchorNameSafe(node, wName, 96);
+                        char aNameBuf[96]{};
+                        size_t k = 0;
+                        for (; k + 1 < sizeof(aNameBuf) && wName[k] != 0; ++k) {
+                            aNameBuf[k] = (wName[k] >= 0x20 && wName[k] <= 0x7E) ? static_cast<char>(wName[k]) : '?';
+                        }
+                        aNameBuf[k] = '\0';
+                        auto* obj = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(node) + 40);
+                        if (IsValidUserPtr(obj)) {
+                            HookEngine::LogMsg(
+                                "[DIAG]    Anchor '%s' mode=%d align=%d sf=%d pos=(%.1f,%.1f)",
+                                aNameBuf,
+                                *reinterpret_cast<const int32_t*>(obj + 0x30),
+                                *reinterpret_cast<const int32_t*>(obj + 0x38),
+                                *reinterpret_cast<const int32_t*>(obj + 0x34),
+                                *reinterpret_cast<const double*>(obj + 0x10),
+                                *reinterpret_cast<const double*>(obj + 0x18));
+                        }
+                        node = g_Sym.fnTreeNext(node);
+                    }
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void LoadPatchConfig(HMODULE hSelf, PatchConfig& outConfig) {
     outConfig = PatchConfig{};
     wchar_t dir[MAX_PATH]{};
     HookEngine::ResolveModuleDir(hSelf, dir, MAX_PATH);
-    wchar_t iniPath[MAX_PATH]{};
-    _snwprintf_s(iniPath, MAX_PATH, _TRUNCATE, L"%s\\FC4_AspectFix.ini", dir);
+    _snwprintf_s(g_IniPath, MAX_PATH, _TRUNCATE, L"%s\\FC4_AspectFix.ini", dir);
 
-    outConfig.enabled = GetPrivateProfileIntW(L"General", L"Enabled", 1, iniPath) != 0;
-    outConfig.disableBlackBars = GetPrivateProfileIntW(L"BlackBars", L"DisableBlackBars", 1, iniPath) != 0;
+    outConfig.enabled = GetPrivateProfileIntW(L"General", L"Enabled", 1, g_IniPath) != 0;
+    outConfig.diagnosticLog = GetPrivateProfileIntW(L"General", L"DiagnosticLog", 0, g_IniPath) != 0;
+    outConfig.disableBlackBars = GetPrivateProfileIntW(L"BlackBars", L"DisableBlackBars", 1, g_IniPath) != 0;
     outConfig.disableCinematicBlackBars =
-        GetPrivateProfileIntW(L"BlackBars", L"DisableCinematicBlackBars", 1, iniPath) != 0;
-    outConfig.adaptiveUi = GetPrivateProfileIntW(L"UI", L"AdaptiveUI", 1, iniPath) != 0;
-    outConfig.fixFov = GetPrivateProfileIntW(L"FOV", L"FixFOV", 1, iniPath) != 0;
+        GetPrivateProfileIntW(L"BlackBars", L"DisableCinematicBlackBars", 1, g_IniPath) != 0;
+    outConfig.adaptiveUi = GetPrivateProfileIntW(L"UI", L"AdaptiveUI", 1, g_IniPath) != 0;
+    outConfig.fixFov = GetPrivateProfileIntW(L"FOV", L"FixFOV", 1, g_IniPath) != 0;
     outConfig.unlockResolutions =
-        GetPrivateProfileIntW(L"Display", L"UnlockResolutions", 1, iniPath) != 0;
+        GetPrivateProfileIntW(L"Display", L"UnlockResolutions", 1, g_IniPath) != 0;
+    outConfig.fixVideoAspectRatio =
+        GetPrivateProfileIntW(L"Video", L"FixVideoAspectRatio", 1, g_IniPath) != 0;
+    outConfig.skipPreRecordedVideos =
+        GetPrivateProfileIntW(L"Video", L"SkipPreRecordedVideos", 1, g_IniPath) != 0;
+    outConfig.showSkipPrompt =
+        GetPrivateProfileIntW(L"Video", L"ShowSkipPrompt", 1, g_IniPath) != 0;
 }
 
 extern "C" void __fastcall ComputeAdaptiveUiLayout(UiLayoutIO* io) {
@@ -773,19 +1620,22 @@ int InitializeEngineSymbols(HMODULE hSelf, HMODULE hFC64) {
     HookEngine::LogInit(hSelf, L"FC4_AspectFix.log");
 
     if (InterlockedCompareExchange(&g_SymbolsResolved, 1, 0) != 0) {
-        return g_Sym.ready ? 10 : 0;
+        return g_Sym.ready ? 17 : 0;
     }
 
     LoadPatchConfig(hSelf, g_Config);
     HookEngine::LogMsg(
         "[CONFIG] Enabled=%d DisableBlackBars=%d DisableCinematicBlackBars=%d "
-        "AdaptiveUI=%d FixFOV=%d UnlockResolutions=%d",
+        "AdaptiveUI=%d FixFOV=%d UnlockResolutions=%d FixVideoAR=%d SkipVideos=%d ShowSkipPrompt=%d",
         g_Config.enabled ? 1 : 0,
         g_Config.disableBlackBars ? 1 : 0,
         g_Config.disableCinematicBlackBars ? 1 : 0,
         g_Config.adaptiveUi ? 1 : 0,
         g_Config.fixFov ? 1 : 0,
-        g_Config.unlockResolutions ? 1 : 0);
+        g_Config.unlockResolutions ? 1 : 0,
+        g_Config.fixVideoAspectRatio ? 1 : 0,
+        g_Config.skipPreRecordedVideos ? 1 : 0,
+        g_Config.showSkipPrompt ? 1 : 0);
 
     if (!g_Config.enabled) {
         HookEngine::LogMsg("[INFO] Disabled via FC4_AspectFix.ini");
@@ -799,7 +1649,7 @@ int InitializeEngineSymbols(HMODULE hSelf, HMODULE hFC64) {
     int resolved = 0;
     uint32_t matches = 0;
 
-    // 1. g_DisplayManagerPtr (RVA 0x2dd84c8, from ContainerScale 0x1301690)
+    // 1. g_DisplayManagerPtr (RVA 0x2dd84c8)
     if (const uint8_t* p = HookEngine::FindPatternInModule(
             hFC64,
             "Sym1_DisplayManager",
@@ -950,7 +1800,7 @@ int InitializeEngineSymbols(HMODULE hSelf, HMODULE hFC64) {
         ++resolved;
     }
 
-    // 10. BlackBars service lookup + vtable method targets
+    // 10. BlackBars service lookup + vtable targets + Sym11 Scaleform SetVisible (0x1cb9550)
     const uint8_t* pUiSys = HookEngine::FindPatternInModule(
         hFC64,
         "Sym10A_UiSystemBlackBars",
@@ -992,10 +1842,122 @@ int InitializeEngineSymbols(HMODULE hSelf, HMODULE hFC64) {
                            RvaOf(hFC64, pSetVis),
                            RvaOf(hFC64, pFadeIn));
         ++resolved;
+
+        if (pSetVis[0x3D] == 0xE8) {
+            g_Sym.fnSetVisible = reinterpret_cast<FnSetVisible>(
+                const_cast<uint8_t*>(HookEngine::ResolveRipRelative(pSetVis + 0x42, ReadI32(pSetVis + 0x3E))));
+            HookEngine::LogMsg("[OK] Sym11_ScaleformSetVisible -> RVA 0x%llX",
+                               RvaOf(hFC64, reinterpret_cast<const void*>(g_Sym.fnSetVisible)));
+            ++resolved;
+        }
     }
 
-    g_Sym.ready = (resolved == 10);
-    HookEngine::LogMsg("[SUMMARY] Resolved %d/10 engine symbols (zero .text bytes modified)", resolved);
+    // 12. Scaleform SetText (RVA 0x1cb99f0)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym12_ScaleformSetText",
+            "c0 74 04 4c 8d 40 18 48 8b 49 10 48 8d 94 24 58 01 00 00 e8 ?? ?? ?? ?? "
+            "8b 08 89 8c 24 40 01 00 00 48 8d 8c 24 40 01 00 00 e8 ?? ?? ?? ?? 8b 47",
+            0x74a455,
+            matches);
+        p && matches == 1) {
+        g_Sym.fnSetText = reinterpret_cast<FnSetText>(
+            const_cast<uint8_t*>(HookEngine::ResolveRipRelative(p + 24, ReadI32(p + 20))));
+        HookEngine::LogMsg("[OK] Sym12_ScaleformSetText -> RVA 0x%llX",
+                           RvaOf(hFC64, reinterpret_cast<const void*>(g_Sym.fnSetText)));
+        ++resolved;
+    }
+
+    // 13. g_Mesh2DPoolHeaderPtr (RVA 0x2d1e438 = &g_Mesh2DPool + 24) from BinkQuadSetup (0x1532d1a)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym13_Mesh2DPool",
+            "48 8d 0d ?? ?? ?? ?? 41 b0 01 48 8b d3 f3 0f 11 45 af 0f 28 45 a7 0f 29 45 c7 "
+            "e8 ?? ?? ?? ?? 48 8b c8 4c 8b e0 e8 ?? ?? ?? ?? b2 01 49 8b cc",
+            0x1532d1a,
+            matches);
+        p && matches == 1) {
+        const uint8_t* poolObj = HookEngine::ResolveRipRelative(p + 7, ReadI32(p + 3));
+        g_Sym.mesh2DPoolHeaderPtr = reinterpret_cast<uint8_t**>(const_cast<uint8_t*>(poolObj + 24));
+        HookEngine::LogMsg("[OK] Sym13_Mesh2DPool -> HeaderPtr RVA 0x%llX",
+                           RvaOf(hFC64, g_Sym.mesh2DPoolHeaderPtr));
+        ++resolved;
+    }
+
+    // 14. g_BinkPlayerMgrPtr (RVA 0x2e4c4a8) + optional g_Video2DArrayHeaderPtr (RVA 0x2d1dc98)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym14_BinkPlayerMgr",
+            "48 89 4c 24 08 53 48 83 ec 20 e8 ?? ?? ?? ?? 48 8b d8 ff 40 08 48 83 78 10 00 74 23 "
+            "48 8b 4c 24 30 e8 ?? ?? ?? ?? 48 8d 54 24 38 48 89 44 24 38 ff 40 08 48 8b 0d ?? ?? ?? ??",
+            0x190a940,
+            matches);
+        p && matches == 1) {
+        g_Sym.binkPlayerMgrPtr = reinterpret_cast<uint8_t**>(
+            const_cast<uint8_t*>(HookEngine::ResolveRipRelative(p + 58, ReadI32(p + 54))));
+        HookEngine::LogMsg("[OK] Sym14_BinkPlayerMgr -> RVA 0x%llX",
+                           RvaOf(hFC64, g_Sym.binkPlayerMgrPtr));
+        ++resolved;
+    }
+
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym14B_Video2DArray",
+            "48 8b 05 ?? ?? ?? ?? 41 81 e3 ff ff ff 00 4d 8b f9 4c 8b 10 8b 43 28 49 8b f8 "
+            "4f 8b 34 da 48 8b f2 4c 8b e1 3b 43 20 75",
+            0x2b5391,
+            matches);
+        p && matches == 1) {
+        g_Sym.video2DArrayHeaderPtr = reinterpret_cast<uint8_t**>(
+            const_cast<uint8_t*>(HookEngine::ResolveRipRelative(p + 7, ReadI32(p + 3))));
+    }
+
+    // 15. FireUI SpriteNode::SetVisible (RVA 0x1d32b00)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym15_SpriteNodeSetVisible",
+            "48 83 ec 28 0f b6 81 24 01 00 00 4c 8b c9 c0 e8 03 24 01 3a d0 74 20 48",
+            0x1d32b00,
+            matches);
+        p && matches == 1) {
+        g_Sym.fnSpriteNodeSetVis = reinterpret_cast<FnSpriteNodeSetVis>(const_cast<uint8_t*>(p));
+        HookEngine::LogMsg("[OK] Sym15_SpriteNodeSetVisible -> RVA 0x%llX",
+                           RvaOf(hFC64, reinterpret_cast<const void*>(g_Sym.fnSpriteNodeSetVis)));
+        ++resolved;
+    }
+
+    // 16. FireUI SpriteNode::Invalidate (RVA 0x1d2c180)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym16_SpriteNodeInvalidate",
+            "48 89 5c 24 08 57 48 83 ec 20 48 8b d9 48 8b 89 00 01 00 00 40 32 ff 48",
+            0x1d2c180,
+            matches);
+        p && matches == 1) {
+        g_Sym.fnSpriteNodeInval = reinterpret_cast<FnSpriteNodeInval>(const_cast<uint8_t*>(p));
+        HookEngine::LogMsg("[OK] Sym16_SpriteNodeInvalidate -> RVA 0x%llX",
+                           RvaOf(hFC64, reinterpret_cast<const void*>(g_Sym.fnSpriteNodeInval)));
+        ++resolved;
+    }
+
+    // 17. CBinkResource VTable (RVA 0x26d50f0) from CBinkResource::ctor (0x197b60)
+    if (const uint8_t* p = HookEngine::FindPatternInModule(
+            hFC64,
+            "Sym17_BinkResourceVTable",
+            "40 53 48 83 ec 20 48 8b d9 e8 ?? ?? ?? ?? 48 8d 05 ?? ?? ?? ?? 48 89 43 10 "
+            "33 c0 4c 8d 1d ?? ?? ?? ?? 4c 89 1b 48 89 83 08 01 00 00 48 89 83 10 01 00 00 "
+            "48 89 83 18 01 00 00 48 89 83 58 01 00 00",
+            0x197b60,
+            matches);
+        p && matches == 1) {
+        g_Sym.binkResourceVTable = HookEngine::ResolveRipRelative(p + 34, ReadI32(p + 30));
+        HookEngine::LogMsg("[OK] Sym17_BinkResourceVTable -> RVA 0x%llX",
+                           RvaOf(hFC64, g_Sym.binkResourceVTable));
+        ++resolved;
+    }
+
+    g_Sym.ready = (resolved == 17);
+    HookEngine::LogMsg("[SUMMARY] Resolved %d/17 engine symbols (zero .text bytes modified)", resolved);
     return resolved;
 }
 
@@ -1009,12 +1971,15 @@ void TickAdaptiveEngineOnMainThread() {
     if (NormalizeDisplayAndRenderConfig(vpW, vpH, aspect)) {
         ApplyAdaptiveUiAnchors(static_cast<double>(vpW), static_cast<double>(vpH));
     }
+    FixBinkVideoQuads();
+    UpdatePreRecordedVideoSkip();
     TryInstallModeProviderHook();
     TryInstallBlackBarsHook();
+    DumpDiagnosticsIfEnabled();
 }
 
 void StartAdaptiveController(HMODULE hSelf, HMODULE hFC64) {
-    if (InitializeEngineSymbols(hSelf, hFC64) != 10) {
+    if (InitializeEngineSymbols(hSelf, hFC64) != 17) {
         return;
     }
     if (InterlockedCompareExchange(&g_ControllerStarted, 1, 0) != 0) {

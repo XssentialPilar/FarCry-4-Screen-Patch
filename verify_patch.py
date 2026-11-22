@@ -113,18 +113,24 @@ def main():
     proxy.FC4_AspectFix_TestApply.argtypes = [ctypes.c_void_p]
     proxy.FC4_AspectFix_TestApply.restype = ctypes.c_int
     resolved = proxy.FC4_AspectFix_TestApply(h_fc64)
-    assert resolved == 10, f"Expected 10 resolved symbols, got {resolved}"
+    assert resolved == 17, f"Expected 17 resolved symbols, got {resolved}"
 
     hash_after = hash_text_section(h_fc64)
     assert hash_before == hash_after, "FC64.dll .text was modified!"
-    print("[PASS] 10/10 symbols resolved uniquely; .text SHA-256 100% UNCHANGED (0 bytes edited)")
+    print("[PASS] 17/17 symbols resolved uniquely; .text SHA-256 100% UNCHANGED (0 bytes edited)")
 
     log_path = os.path.join(bin_dir, "FC4_AspectFix.log")
     with open(log_path, "r", encoding="utf-8") as f:
         log_text = f.read()
     assert "[ERROR]" not in log_text, f"Errors in log:\n{log_text}"
     assert "[WARN]" not in log_text, f"Warnings in log:\n{log_text}"
-    assert "[SUMMARY] Resolved 10/10 engine symbols" in log_text
+    assert "[SUMMARY] Resolved 17/17 engine symbols" in log_text
+    for sym in (
+        "Sym15_SpriteNodeSetVisible",
+        "Sym16_SpriteNodeInvalidate",
+        "Sym17_BinkResourceVTable",
+    ):
+        assert sym in log_text, f"Missing {sym} in log"
     print("[PASS] FC4_AspectFix.log clean (zero warnings/errors)")
 
     fn_ui = proxy.FC4_AspectFix_ComputeUiLayout

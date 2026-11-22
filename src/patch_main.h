@@ -11,6 +11,10 @@ struct PatchConfig {
     bool adaptiveUi = true;
     bool fixFov = true;
     bool unlockResolutions = true;
+    bool fixVideoAspectRatio = true;
+    bool skipPreRecordedVideos = true;
+    bool showSkipPrompt = true;
+    bool diagnosticLog = false;
 };
 
 struct UiLayoutIO {

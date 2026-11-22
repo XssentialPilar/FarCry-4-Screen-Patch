@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-11-22
+
+### Added
+- **Full-Screen Menu, World Map, and Backdrop Black-Bar Removal**:
+  - Recursive FireUI `SpriteNode` visibility sweep (`Sym15_SpriteNodeSetVisible`, `Sym16_SpriteNodeInvalidate`) suppresses baked off-stage `1280x200` and `6000x500` letterbox bars inside `PauseRoot` (`lyt_tabBar`), `WorldMap` (`lyt_mcFrontUI -> mcVignetteContainer`, including the 16:9 edge vignette frame), Pause Menu, Shop, Skills, Crafting, Progress, Collections, and Weapon Wheel.
+  - Aspect-preserving, origin-invariant `Cover-Fit` scaling for full-screen backdrops including `lyt_mcMainMenuBG` (Main Menu backdrop), `lyt_mcBG` (Loading Screen), `PressStart` (`Press Any Key`), `lyt_mcBack`, `lyt_mcDefaultBG`, and `lyt_mcBackground*`.
+  - Proportional stage centering (`min(W / 1280, H / 720)`) for `1280x720` menu containers over `Cover-Fit` backdrops on non-16:9 displays.
+- **Pre-Recorded Bink Video Aspect Ratio Fix & Independent Skip**:
+  - Expands fullscreen Bink video quads (`g_Mesh2DPool` & `g_Video2DArray`) with aspect-preserving `Cover-Fit` (`[Video] FixVideoAspectRatio=1`).
+  - Independent skip for non-looping pre-recorded videos (startup intros via `Mesh2DPool` + `CBinkResource` vtable `Sym17_BinkResourceVTable`, and story cutscenes via `BinkPlayerMgr`) by pressing any keyboard key, mouse button, or XInput controller button (`[Video] SkipPreRecordedVideos=1`).
+  - Discrete in-game `F8` toggle with native on-screen prompt/toast via `SubTitleText2` (`[Video] ShowSkipPrompt=1`) persisted directly to `FC4_AspectFix.ini`.
+- Expanded read-only AOB discovery to **17/17** unique engine symbols with zero `.text` bytes modified.
+- Added `[General] DiagnosticLog` optional logging toggle in `FC4_AspectFix.ini`.
+
 ## [2.0.0] - 2026-11-22
 
 ### Added
