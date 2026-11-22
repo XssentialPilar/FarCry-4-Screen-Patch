@@ -56,11 +56,22 @@ If `x86_64-w64-mingw32-clang++.exe` is not on your `PATH`, pass `-CompilerPath` 
 
 The compiled `dinput8.dll` and `FC4_AspectFix.ini` will be placed in `dist\`.
 
+## Verification
+
+To verify symbol resolution, `.text` immutability, proxy forwarding, and aspect-ratio math against an installed copy of `FC64.dll` (requires Python 3.10+ and `pefile`):
+
+```powershell
+python .\verify_patch.py --bin-dir "C:\Program Files (x86)\Steam\steamapps\common\Far Cry 4\bin"
+```
+
 ## Project Structure
 
 - `src/dinput8_proxy.cpp` - `dinput8.dll` proxy forwarder, `FarCry4.exe` IAT hook on `FC64.dll!RunGame`, and lifecycle entry points.
-- `src/dinput8.def` - Official `dinput8.dll` export table (`@1`–`@6`) and test export.
+- `src/dinput8.def` - Official `dinput8.dll` export table (`@1`-`@6`) and test export.
 - `src/hook_engine.h` - Read-only PE `.text` AOB scanner, RIP-relative resolver, IAT helper, and thread-safe file logger.
 - `src/patch_main.h` / `src/patch_main.cpp` - Engine symbol resolution, viewport/FOV normalization, heap VTable hooks, and main-thread adaptive UI controller.
 - `config/FC4_AspectFix.ini` - Default runtime configuration file.
 - `build.ps1` - Reproducible static build script (`-static -static-libgcc -static-libstdc++`).
+- `verify_patch.py` - Automated verification suite across 18 aspect ratios.
+- `CHANGELOG.md` - Version history.
+- `LICENSE` - MIT License.
