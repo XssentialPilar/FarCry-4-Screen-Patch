@@ -13,6 +13,19 @@ Designed to adapt the game viewport and all internal Scaleform/Flash UI elements
 - **Correct Native FOV Scaling**: Automatically sets `UseWidescreenFOV` to **Vert+** (`0`) at `<= 16:9` (preventing horizontal cropping) and **Hor+** (`1`) at `> 16:9` (preserving vertical FOV).
 - **Resolution Filter Removal**: Hooks `ModeProvider` via its heap VTable to remove aspect-ratio filtering in the video options menu.
 
+## Screenshots
+
+Captured in-game running on a 16:10 display with full edge-to-edge viewport rendering, no pillarbox or letterbox bars, unstretched Scaleform HUD anchoring, and corrected Vert+ vertical FOV:
+
+### Full-Screen Panoramic Vista and Adaptive HUD Anchoring
+![Kyrat valley vista with full viewport and edge-anchored minimap](assets/screenshots/kyrat-vista-16x10.jpg)
+
+### Vertical Architecture and Proportional Viewmodel / Minimap Scaling
+![Bell tower full vertical framing and proportional HUD layout](assets/screenshots/bell-tower-hud-16x10.jpg)
+
+### Uncropped Vertical Field of View (Vert+)
+![Open sky and vertical FOV framing without black bars](assets/screenshots/sky-eagle-fov-16x10.jpg)
+
 ## Installation (Pre-built Release)
 
 1. Download the latest release archive (`FarCry4-Screen-Patch-v2.0.0.zip`) from the **Releases** page.
