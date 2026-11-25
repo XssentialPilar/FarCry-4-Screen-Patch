@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.0] - 2026-11-25
+
+### Fixed
+
+- Expand the legacy centered 16:9 cursor confinement to the full game client area when the patch expands the viewport. The adjustment is scoped to the focused game window and releases on deactivation.
+- Keep the main menu and login foreground proportional above their full-screen backdrops. Place the game version below the player ID.
+- Center the weapon wheel and its auxiliary item groups, keep mission panels and the save icon proportional, and extend the map and menu gradient layers independently of their controls.
+
 ## [2.2.0] - 2026-11-22
 
 ### Added

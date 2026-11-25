@@ -2,6 +2,7 @@
 #include "hook_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -90,6 +91,32 @@ struct EngineSymbols {
     bool ready = false;
 };
 
+struct SpritePlacement {
+    double sx;
+    double sy;
+    double x;
+    double y;
+    double rotateSkew0 = 0.0;
+    double rotateSkew1 = 0.0;
+};
+
+struct SceneClipCache {
+    uint8_t* node = nullptr;
+    SpritePlacement last{};
+};
+
+enum class SceneLayout {
+    None,
+    StartupPage,
+    MenuCommon,
+    MapFront,
+    MapCommon,
+    WeaponWheel,
+    MissionPopup,
+    SaveSpinner,
+    MainMenuPage,
+};
+
 struct AnchorCacheEntry {
     void* gfxObj = nullptr;
     double vpW = 0.0;
@@ -106,6 +133,11 @@ struct AnchorCacheEntry {
     int32_t bScaleX = -1;
     int32_t bScaleY = -1;
     uint8_t specialKind = 0;
+    uint8_t* spriteRoot = nullptr;
+    SceneLayout scene = SceneLayout::None;
+    std::array<SceneClipCache, 5> clips{};
+    SceneClipCache menuVersion{};
+    bool visited = false;
 };
 
 PatchConfig g_Config{};
@@ -824,7 +856,8 @@ uint32_t SweepBakedBlackBarsRecursive(
     uint8_t* parentNode,
     uint32_t depth,
     uint32_t& budget,
-    bool hideDirectParentOfBars) {
+    bool hideDirectParentOfBars,
+    const uint8_t* viewportFill) {
     if (!IsValidUserPtr(parentNode) || depth > 3 || budget == 0) {
         return 0;
     }
@@ -834,6 +867,10 @@ uint32_t SweepBakedBlackBarsRecursive(
 
     while (IsValidUserPtr(child) && budget > 0) {
         --budget;
+        if (child == viewportFill) {
+            child = *reinterpret_cast<uint8_t**>(child + 168);
+            continue;
+        }
         const double sx = std::fabs(static_cast<double>(ReadI32(child + 56)) / 65536.0);
         const double sy = std::fabs(static_cast<double>(ReadI32(child + 68)) / 65536.0);
         const double ty = static_cast<double>(ReadI32(child + 76)) / 20.0;
@@ -848,7 +885,7 @@ uint32_t SweepBakedBlackBarsRecursive(
                 ++hiddenHere;
             }
         } else if (depth < 3) {
-            hiddenHere += SweepBakedBlackBarsRecursive(child, depth + 1, budget, hideDirectParentOfBars);
+            hiddenHere += SweepBakedBlackBarsRecursive(child, depth + 1, budget, hideDirectParentOfBars, viewportFill);
         }
         child = *reinterpret_cast<uint8_t**>(child + 168);  // nextSibling
     }
@@ -864,25 +901,29 @@ uint32_t SweepBakedBlackBarsRecursive(
     return hiddenHere;
 }
 
-void SweepBakedBlackBarsOnGfxObj(void* gfxObj, bool hideDirectParentOfBars) {
-    if (!g_Config.disableBlackBars || !IsValidUserPtr(gfxObj) ||
-        !g_Sym.fnSpriteNodeSetVis || !g_Sym.fnSpriteNodeInval) {
-        return;
+uint8_t* GetSpriteRoot(void* gfxObj) {
+    if (!IsValidUserPtr(gfxObj)) {
+        return nullptr;
     }
     uint8_t* handle = *reinterpret_cast<uint8_t**>(gfxObj);
     if (!IsValidUserPtr(handle)) {
-        return;
+        return nullptr;
     }
     uint8_t* asObj = *reinterpret_cast<uint8_t**>(handle + 48);
     if (!IsValidUserPtr(asObj) || !IsValidUserPtr(*reinterpret_cast<uint8_t**>(asObj + 136))) {
-        return;
+        return nullptr;
     }
     uint8_t* spriteNode = *reinterpret_cast<uint8_t**>(asObj + 176);
-    if (!IsValidUserPtr(spriteNode)) {
+    return IsValidUserPtr(spriteNode) ? spriteNode : nullptr;
+}
+
+void SweepBakedBlackBars(uint8_t* spriteNode, bool hideDirectParentOfBars,
+                        const uint8_t* viewportFill = nullptr) {
+    if (!g_Config.disableBlackBars || !spriteNode || !g_Sym.fnSpriteNodeSetVis || !g_Sym.fnSpriteNodeInval) {
         return;
     }
     uint32_t budget = 192;
-    const uint32_t hidden = SweepBakedBlackBarsRecursive(spriteNode, 0, budget, hideDirectParentOfBars);
+    const uint32_t hidden = SweepBakedBlackBarsRecursive(spriteNode, 0, budget, hideDirectParentOfBars, viewportFill);
     if (hidden > 0) {
         static volatile LONG s_loggedBaked = 0;
         if (InterlockedIncrement(&s_loggedBaked) <= 6) {
@@ -890,6 +931,287 @@ void SweepBakedBlackBarsOnGfxObj(void* gfxObj, bool hideDirectParentOfBars) {
                                hidden, hideDirectParentOfBars ? 1 : 0);
         }
     }
+}
+
+
+SpritePlacement ReadSpritePlacement(const uint8_t* node) {
+    return {ReadI32(node + 56) / 65536.0, ReadI32(node + 68) / 65536.0,
+            ReadI32(node + 72) / 20.0, ReadI32(node + 76) / 20.0,
+            ReadI32(node + 60) / 65536.0, ReadI32(node + 64) / 65536.0};
+}
+
+bool IsAxisAligned(const uint8_t* node) {
+    return ReadI32(node + 60) == 0 && ReadI32(node + 64) == 0;
+}
+
+bool MatchesPlacement(const SpritePlacement& a, const SpritePlacement& b) {
+    return std::fabs(a.sx - b.sx) < 0.001 && std::fabs(a.sy - b.sy) < 0.001 &&
+           std::fabs(a.x - b.x) < 0.075 && std::fabs(a.y - b.y) < 0.075 &&
+           std::fabs(a.rotateSkew0 - b.rotateSkew0) < 0.001 &&
+           std::fabs(a.rotateSkew1 - b.rotateSkew1) < 0.001;
+}
+
+uint8_t* FirstSpriteChild(uint8_t* node) {
+    return *reinterpret_cast<uint8_t**>(node + 176);
+}
+
+uint8_t* NextSpriteSibling(uint8_t* node) {
+    return *reinterpret_cast<uint8_t**>(node + 168);
+}
+
+bool SetSpritePlacement(uint8_t* node, const SpritePlacement& target) {
+    // FIRE stores the local transform in 16.16 scale units and twips. Invalidate
+    // the node and its display tree through the same path as the engine's setters.
+    if (!g_Sym.fnSpriteNodeInval || !IsValidUserPtr(*reinterpret_cast<void**>(node + 152))) {
+        return false;
+    }
+    const std::array<int32_t, 6> values{
+        static_cast<int32_t>(std::lround(target.sx * 65536.0)),
+        static_cast<int32_t>(std::lround(target.sy * 65536.0)),
+        static_cast<int32_t>(std::lround(target.x * 20.0)),
+        static_cast<int32_t>(std::lround(target.y * 20.0)),
+        static_cast<int32_t>(std::lround(target.rotateSkew0 * 65536.0)),
+        static_cast<int32_t>(std::lround(target.rotateSkew1 * 65536.0)),
+    };
+    constexpr std::array<int, 6> offsets{56, 68, 72, 76, 60, 64};
+    bool changed = false;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        auto& current = *reinterpret_cast<int32_t*>(node + offsets[i]);
+        if (current != values[i]) {
+            current = values[i];
+            changed = true;
+        }
+    }
+    if (changed) {
+        // A scale change invalidates the reusable translation-only bounds.
+        node[293] &= static_cast<uint8_t>(~1U);
+        g_Sym.fnSpriteNodeInval(node);
+        *reinterpret_cast<uint32_t*>(node + 100) |= 1U;
+    }
+    return true;
+}
+
+uint8_t* FindSceneClip(uint8_t* root, SceneClipCache& cache, const SpritePlacement& authored) {
+    // Check only direct children of the identified native movie anchor. Honor
+    // authored matrices when the game rebuilds a page or restores its timeline.
+    auto* child = FirstSpriteChild(root);
+    for (unsigned i = 0; i < 128 && IsValidUserPtr(child); ++i, child = NextSpriteSibling(child)) {
+        const SpritePlacement current = ReadSpritePlacement(child);
+        if (MatchesPlacement(current, authored) ||
+            (child == cache.node && MatchesPlacement(current, cache.last))) {
+            return child;
+        }
+    }
+    cache = {};
+    return nullptr;
+}
+
+void UpdateSceneClip(uint8_t* node, SceneClipCache& cache, const SpritePlacement& target) {
+    if (node && SetSpritePlacement(node, target)) {
+        cache = {node, target};
+    }
+}
+
+void UpdateSceneClip(uint8_t* root, SceneClipCache& cache, const SpritePlacement& authored,
+                     const SpritePlacement& target) {
+    UpdateSceneClip(FindSceneClip(root, cache, authored), cache, target);
+}
+
+void ApplyWeaponWheelShortcuts(uint8_t* root, std::array<SceneClipCache, 5>& clips) {
+    auto* utilities = FindSceneClip(root, clips[0], {1.0, 1.0, -400.0, 229.0});
+    auto* arrows = FindSceneClip(root, clips[1], {1.0, 1.0, 386.0, 226.0});
+    auto* sticky = FindSceneClip(root, clips[2], {1.0, 1.0, 515.5, 207.0});
+    if (!utilities || !arrows) {
+        return;
+    }
+
+    // Native group bounds include the keycaps and counters. Put the groups
+    // on one line under the wheel and center their combined footprint.
+    constexpr double utilityLeft = -234.0, utilityRight = 148.0;
+    constexpr double arrowLeft = -86.0, arrowRight = 69.0;
+    constexpr double stickyLeft = -49.0, stickyRight = 31.0;
+    constexpr double gap = 36.0;
+    constexpr double utilityWidth = utilityRight - utilityLeft;
+    constexpr double arrowWidth = arrowRight - arrowLeft;
+    constexpr double stickyWidth = stickyRight - stickyLeft;
+    const bool showSticky = sticky && (sticky[292] & 8) != 0;
+    const double rowWidth = utilityWidth + gap + arrowWidth + (showSticky ? gap + stickyWidth : 0.0);
+    const double start = -rowWidth * 0.5;
+
+    UpdateSceneClip(utilities, clips[0], {1.0, 1.0, start - utilityLeft, 270.0});
+    UpdateSceneClip(arrows, clips[1], {1.0, 1.0, start + utilityWidth + gap - arrowLeft, 268.0});
+    UpdateSceneClip(sticky, clips[2],
+        {1.0, 1.0, start + utilityWidth + arrowWidth + 2.0 * gap - stickyLeft, 249.0});
+}
+
+bool UsesForegroundFit(SceneLayout scene) {
+    return scene == SceneLayout::StartupPage || scene == SceneLayout::MainMenuPage ||
+           scene == SceneLayout::MissionPopup || scene == SceneLayout::SaveSpinner;
+}
+
+SpritePlacement FitForeground(SceneLayout scene, const UiLayoutIO& safeLayout) {
+    const double scale = safeLayout.scaleX;
+    const double centerX = (safeLayout.safeL + safeLayout.safeR) * 0.5;
+    const double centerY = (safeLayout.safeT + safeLayout.safeB) * 0.5;
+    if (scene == SceneLayout::MissionPopup) {
+        return {scale, scale, centerX, centerY};
+    }
+    if (scene == SceneLayout::SaveSpinner) {
+        return {scale, scale, safeLayout.safeR - 1280.0 * scale, safeLayout.safeT};
+    }
+    return {scale, scale, centerX - 640.0 * scale, centerY - 360.0 * scale};
+}
+
+void SuppressMainMenuFrame(uint8_t* root) {
+    // MainRoot's blackBars clip contains four decorative panels. The upper
+    // panel begins at y=0 in its own clip, at y=-600 on the centered stage.
+    constexpr SpritePlacement box{1.0, 1.0, -3000.0, -600.0};
+    constexpr SpritePlacement top{187.5, 19.0476, 0.0, 0.0};
+    constexpr SpritePlacement bottom{187.5, 19.0476, 0.0, 1320.0};
+    SceneClipCache unused{};
+    auto* frame = FindSceneClip(root, unused, box);
+    if (frame && FindSceneClip(frame, unused, top) && FindSceneClip(frame, unused, bottom)) {
+        HideSpriteNodeClean(frame);
+    }
+}
+
+void ApplySceneLayout(AnchorCacheEntry& entry, const UiLayoutIO& viewport, bool adaptUI) {
+    auto* root = entry.spriteRoot;
+    if (!root || !IsAxisAligned(root)) {
+        return;
+    }
+    if (g_Config.disableBlackBars && entry.scene == SceneLayout::MenuCommon) {
+        SuppressMainMenuFrame(root);
+    }
+    if (!adaptUI) {
+        return;
+    }
+
+    const SpritePlacement parent = ReadSpritePlacement(root);
+    if (parent.sx < 0.01 || parent.sy < 0.01) {
+        return;
+    }
+    const double left = -parent.x / parent.sx;
+    const double right = (viewport.vpW - parent.x) / parent.sx;
+    const double bottom = (viewport.vpH - parent.y) / parent.sy;
+    const double safeRight = (viewport.safeR - parent.x) / parent.sx;
+    const double safeBottom = (viewport.safeB - parent.y) / parent.sy;
+    auto& clips = entry.clips;
+
+    switch (entry.scene) {
+        case SceneLayout::MainMenuPage: {
+            constexpr SpritePlacement authored{1.0, 1.0, 104.0, 680.0};
+            if (auto* version = FindSceneClip(root, entry.menuVersion, authored)) {
+                // PauseBg anchors onlineWidget at design Y=653 relative to
+                // the safe bottom. Its username starts at X=168 and the
+                // widget's own background ends 24.45 units below its origin.
+                UiLayoutIO safe = viewport;
+                safe.mode = 2;
+                ComputeAdaptiveUiLayout(&safe);
+                const double scale = safe.scaleX;
+                const double versionX = safe.safeL + 168.0 * scale;
+                const double versionY = safe.safeB - (720.0 - 653.0 - 27.0) * scale;
+                UpdateSceneClip(version, entry.menuVersion,
+                    {scale / parent.sx, scale / parent.sy, (versionX - parent.x) / parent.sx,
+                     (versionY - parent.y) / parent.sy});
+                break;
+            }
+            // The main-menu movie also hosts PressStart before Campaign loads.
+            [[fallthrough]];
+        }
+        case SceneLayout::StartupPage: {
+            // PressStart's decorative layers use cover. Its logo and login
+            // status stay on the uniformly fitted foreground.
+            constexpr SpritePlacement base{40.0, 22.5, 0.0, 0.0};
+            constexpr SpritePlacement color{1.0, 1.0, 0.0, 0.0};
+            auto* baseNode = FirstSpriteChild(root);
+            if (!IsValidUserPtr(baseNode) ||
+                (!MatchesPlacement(ReadSpritePlacement(baseNode), base) && baseNode != clips[0].node)) {
+                break;
+            }
+            auto* colorNode = NextSpriteSibling(baseNode);
+            if (!IsValidUserPtr(colorNode) ||
+                (!MatchesPlacement(ReadSpritePlacement(colorNode), color) && colorNode != clips[1].node)) {
+                break;
+            }
+
+            const double cover = std::max(viewport.vpW / 1280.0, viewport.vpH / 720.0);
+            const double sx = cover / parent.sx;
+            const double sy = cover / parent.sy;
+            const double x = (viewport.vpW * 0.5 - 640.0 * cover - parent.x) / parent.sx;
+            const double y = (viewport.vpH * 0.5 - 360.0 * cover - parent.y) / parent.sy;
+            const auto coverLayer = [=](const SpritePlacement& src) -> SpritePlacement {
+                return {src.sx * sx, src.sy * sy, x + src.x * sx, y + src.y * sy,
+                        src.rotateSkew0 * sy, src.rotateSkew1 * sx};
+            };
+            constexpr SpritePlacement blueCorner{0.0, 0.0, 0.0, 0.0, 11.2268676758, -19.994140625};
+            constexpr SpritePlacement redCorner{0.0, 0.0, 1280.0, 718.5, -11.2189941406, 19.9991149902};
+            constexpr SpritePlacement smoke{5.0, 2.8125, 640.0, 360.0};
+            UpdateSceneClip(baseNode, clips[0], coverLayer(base));
+            UpdateSceneClip(colorNode, clips[1], coverLayer(color));
+            UpdateSceneClip(root, clips[2], blueCorner, coverLayer(blueCorner));
+            UpdateSceneClip(root, clips[3], redCorner, coverLayer(redCorner));
+            UpdateSceneClip(root, clips[4], smoke, coverLayer(smoke));
+            break;
+        }
+        case SceneLayout::MapFront: {
+            // WorldMap's unnamed bottom gradient is 1280 x 100, centered
+            // at (640,648) with 1.44 Y scale. Move its bottom to the real edge.
+            UpdateSceneClip(root, clips[0], {1.0, 1.44, 640.0, 648.0},
+                {(right - left) / 1280.0, 1.44, (left + right) * 0.5, bottom - 72.0});
+            UpdateSceneClip(root, clips[1], {1.0, 1.0, 999.0, 174.0},
+                {1.0, 1.0, safeRight - 281.0, 174.0});
+            UpdateSceneClip(root, clips[2], {1.0, 1.0, 999.0, 204.0},
+                {1.0, 1.0, safeRight - 281.0, 204.0});
+            UpdateSceneClip(root, clips[3], {1.0, 1.0, 812.0, 603.0},
+                {1.0, 1.0, safeRight - 468.0, safeBottom - 117.0});
+            UpdateSceneClip(root, clips[4], {1.0, 1.0, 950.8, 570.1},
+                {1.0, 1.0, safeRight - 329.2, safeBottom - 149.9});
+            break;
+        }
+        case SceneLayout::MapCommon:
+        case SceneLayout::MenuCommon: {
+            const double y = entry.scene == SceneLayout::MapCommon ? 637.0 : 638.0;
+            UpdateSceneClip(root, clips[0], {1.0, 1.0, 1183.0, y},
+                {1.0, 1.0, safeRight - 97.0, safeBottom - (720.0 - y)});
+            break;
+        }
+        case SceneLayout::WeaponWheel:
+            ApplyWeaponWheelShortcuts(root, clips);
+            break;
+        case SceneLayout::MissionPopup: {
+            // FloatBox has one full-screen dimmer behind its content, with
+            // authored horizontal bleed. Scale only that child to the canvas.
+            constexpr SpritePlacement dimmer{40.001, 22.5, 0.0, 0.0};
+            UpdateSceneClip(root, clips[0], dimmer,
+                {dimmer.sx * viewport.vpW / (1280.0 * parent.sx),
+                 dimmer.sy * viewport.vpH / (720.0 * parent.sy),
+                 (viewport.vpW * 0.5 - parent.x) / parent.sx,
+                 (viewport.vpH * 0.5 - parent.y) / parent.sy});
+            break;
+        }
+        case SceneLayout::SaveSpinner:
+            // The save layer also has a separate top-left full-screen
+            // fill. Its two sibling foreground clips use the safe frame.
+            UpdateSceneClip(root, clips[0], {40.0, 22.5, 0.0, 0.0},
+                {viewport.vpW / (32.0 * parent.sx), viewport.vpH / (32.0 * parent.sy),
+                 left, -parent.y / parent.sy});
+            break;
+        case SceneLayout::None:
+            break;
+    }
+}
+
+bool HasAnchor(uint8_t* treeHead, uint32_t count, const wchar_t* name) {
+    auto* node = *reinterpret_cast<void**>(treeHead);
+    for (uint32_t i = 0; i < count && IsValidUserPtr(node) && node != treeHead;
+         ++i, node = g_Sym.fnTreeNext(node)) {
+        wchar_t anchor[96]{};
+        if (ReadAnchorNameSafe(node, anchor, 96) && EqualsCaseInsensitiveW(anchor, name)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
@@ -928,12 +1250,11 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
         }
     }
 
-    static double s_lastUiW = 0.0;
-    static double s_lastUiH = 0.0;
-    if (std::fabs(s_lastUiW - vpW) > 0.5 || std::fabs(s_lastUiH - vpH) > 0.5 || g_AnchorCache.size() > 4096) {
-        s_lastUiW = vpW;
-        s_lastUiH = vpH;
-        g_AnchorCache.clear();
+    const bool pruneCache = g_AnchorCache.size() > 4096;
+    if (pruneCache) {
+        for (auto& item : g_AnchorCache) {
+            item.second.visited = false;
+        }
     }
 
     for (uint32_t m = 0; m < movieCount; ++m) {
@@ -953,6 +1274,13 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
 
         const char* movieName = ReadMovieNameSafe(mov);
         const bool isPressStartMovie = ContainsCaseInsensitiveA(movieName, "PressStart");
+        const bool isStartup = ContainsCaseInsensitiveA(movieName, "Initial Screens");
+        const bool isMainMenu = ContainsCaseInsensitiveA(movieName, "Multi main menu");
+        const bool isWorldMap = ContainsCaseInsensitiveA(movieName, "Pause_") &&
+                                HasAnchor(treeHead, anchorCount, L"lyt_mcFrontUI") &&
+                                HasAnchor(treeHead, anchorCount, L"MapContainer");
+        const bool isHud = ContainsCaseInsensitiveA(movieName, "SINGLE+COOP HUD");
+        const bool isFirePlayer = ContainsCaseInsensitiveA(movieName, "fireuiplayer");
 
         void* node = *reinterpret_cast<void**>(treeHead);
         uint32_t visited = 0;
@@ -975,10 +1303,24 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                         // Sweep baked 1280x200 / 6000x500 letterbox child sprites inside tabBar,
                         // WorldMap mcFrontUI->mcVignetteContainer, WeaponWheel, etc.
                         const bool isWorldMapFront = EqualsCaseInsensitiveW(aName, L"lyt_mcFrontUI");
-                        if (g_Config.disableBlackBars) {
-                            SweepBakedBlackBarsOnGfxObj(gfxObj, isWorldMapFront);
+                        SceneLayout scene = SceneLayout::None;
+                        if ((isStartup || isMainMenu || isPressStartMovie) && EqualsCaseInsensitiveW(aName, L"lyt_page")) {
+                            scene = isMainMenu ? SceneLayout::MainMenuPage : SceneLayout::StartupPage;
+                        } else if (isWorldMap && isWorldMapFront) {
+                            scene = SceneLayout::MapFront;
+                        } else if ((isMainMenu || isStartup || isWorldMap) &&
+                                   EqualsCaseInsensitiveW(aName, L"lyt_mcCommon")) {
+                            scene = isWorldMap ? SceneLayout::MapCommon : SceneLayout::MenuCommon;
+                        } else if (isHud && EqualsCaseInsensitiveW(aName, L"Wheel")) {
+                            scene = SceneLayout::WeaponWheel;
+                        } else if (isHud && EqualsCaseInsensitiveW(aName, L"FloatBoxContainer")) {
+                            scene = SceneLayout::MissionPopup;
+                        } else if (isFirePlayer && EqualsCaseInsensitiveW(aName, L"SaveSpinnerMC")) {
+                            scene = SceneLayout::SaveSpinner;
                         }
-
+                        const bool foregroundFit = UsesForegroundFit(scene);
+                        uint8_t* spriteRoot = (g_Config.disableBlackBars || scene != SceneLayout::None)
+                                            ? GetSpriteRoot(gfxObj) : nullptr;
                         const double elemX = *reinterpret_cast<const double*>(obj + 0x10);
                         const double elemY = *reinterpret_cast<const double*>(obj + 0x18);
                         const double curCachedW = *reinterpret_cast<const double*>(obj + 0x20);
@@ -1014,8 +1356,7 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                                     EqualsCaseInsensitiveW(aName, L"lyt_mcPowderBack") ||
                                     EqualsCaseInsensitiveW(aName, L"lyt_art") ||
                                     StartsWithCaseInsensitiveW(aName, L"lyt_bg") ||
-                                    ContainsCaseInsensitiveW(aName, L"background") ||
-                                    (isPressStartMovie && EqualsCaseInsensitiveW(aName, L"lyt_page")))) {
+                                    ContainsCaseInsensitiveW(aName, L"background"))) {
                             specialKind = 2;
                         } else if (g_Config.adaptiveUi &&
                                    isLytAnchor && anchorCount <= 12 &&
@@ -1026,7 +1367,8 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             specialKind = 3;
                         }
 
-                        if (!g_Config.adaptiveUi && specialKind != 1) {
+                        if (!g_Config.adaptiveUi && specialKind != 1 && scene != SceneLayout::MenuCommon) {
+                            SweepBakedBlackBars(spriteRoot, isWorldMapFront);
                             node = g_Sym.fnTreeNext(node);
                             continue;
                         }
@@ -1038,7 +1380,7 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                         io.safeT = safeT;
                         io.safeR = safeR;
                         io.safeB = safeB;
-                        io.mode = mode;
+                        io.mode = foregroundFit ? 1 : mode;
                         ComputeAdaptiveUiLayout(&io);
 
                         const double markedW = io.cachedW + kAppliedMarkerEps;
@@ -1050,6 +1392,7 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             const AnchorCacheEntry& c = it->second;
                             if (c.gfxObj != gfxObj ||
                                 c.specialKind != specialKind ||
+                                c.scene != scene ||
                                 std::fabs(c.vpW - vpW) > 0.5 ||
                                 std::fabs(c.vpH - vpH) > 0.5 ||
                                 std::fabs(c.safeL - safeL) > 0.5 ||
@@ -1073,7 +1416,7 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             g_Sym.fnSetVisible(gfxObj, &visStatus, 0);
                         }
 
-                        if (needsApply) {
+                        if (needsApply && (g_Config.adaptiveUi || specialKind == 1)) {
                             *reinterpret_cast<double*>(obj + 0x20) = markedW;
                             *reinterpret_cast<double*>(obj + 0x28) = markedH;
 
@@ -1090,6 +1433,19 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                                 static volatile LONG s_loggedBB = 0;
                                 if (InterlockedCompareExchange(&s_loggedBB, 1, 0) == 0) {
                                     HookEngine::LogMsg("[LIVE] Flash BlackBars clip suppressed directly");
+                                }
+                            } else if (foregroundFit) {
+                                const SpritePlacement fit = FitForeground(scene, io);
+                                g_Sym.fnSetXScale(gfxObj, &status, fit.sx);
+                                g_Sym.fnSetYScale(gfxObj, &status, fit.sy);
+                                g_Sym.fnSetX(gfxObj, &status, fit.x);
+                                g_Sym.fnSetY(gfxObj, &status, fit.y);
+
+                                static volatile LONG loggedForegrounds = 0;
+                                const LONG bit = 1L << static_cast<unsigned>(scene);
+                                if ((InterlockedOr(&loggedForegrounds, bit) & bit) == 0 || g_Config.diagnosticLog) {
+                                    HookEngine::LogMsg("[LIVE] Uniform foreground %ls in %s at %.0fx%.0f scale=%.4f",
+                                                       aName, movieName, vpW, vpH, fit.sx);
                                 }
                             } else if (specialKind == 2) {
                                 // Full-bleed aspect-preserving Cover-Fit (origin-invariant for both (0,0) and (640,360))
@@ -1185,7 +1541,42 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                                 }
                             }
 
-                            AnchorCacheEntry entry{};
+                        }
+
+                        auto& entry = g_AnchorCache[obj];
+                        entry.visited = true;
+                        if (entry.spriteRoot != spriteRoot || entry.scene != scene || entry.gfxObj != gfxObj) {
+                            entry.clips = {};
+                            entry.menuVersion = {};
+                            entry.spriteRoot = spriteRoot;
+                            entry.scene = scene;
+                        }
+                        if (scene != SceneLayout::None) {
+                            UiLayoutIO viewport{};
+                            viewport.vpW = vpW;
+                            viewport.vpH = vpH;
+                            viewport.safeL = safeL;
+                            viewport.safeT = safeT;
+                            viewport.safeB = safeB;
+                            viewport.safeR = safeR;
+                            const bool hadLayout = entry.clips[0].node != nullptr;
+                            const bool hadMenuVersion = entry.menuVersion.node != nullptr;
+                            ApplySceneLayout(entry, viewport, g_Config.adaptiveUi);
+                            if (entry.menuVersion.node && !hadMenuVersion) {
+                                HookEngine::LogMsg("[LIVE] Main-menu version anchored below the player ID");
+                            }
+                            if (entry.clips[0].node && (!hadLayout || needsApply)) {
+                                static volatile LONG loggedScenes = 0;
+                                const LONG bit = 1L << static_cast<unsigned>(scene);
+                                if ((InterlockedOr(&loggedScenes, bit) & bit) == 0 || g_Config.diagnosticLog) {
+                                    HookEngine::LogMsg("[LIVE] Scene layout %ls in %s at %.0fx%.0f", aName, movieName, vpW, vpH);
+                                }
+                            }
+                        }
+                        // A fitted page can place its full-viewport fill above
+                        // the authored frame. It belongs to the UI, not the bars.
+                        SweepBakedBlackBars(spriteRoot, isWorldMapFront, entry.clips[0].node);
+                        if (needsApply && (g_Config.adaptiveUi || specialKind == 1)) {
                             entry.gfxObj = gfxObj;
                             entry.vpW = vpW;
                             entry.vpH = vpH;
@@ -1201,7 +1592,6 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
                             entry.bScaleX = bScaleX;
                             entry.bScaleY = bScaleY;
                             entry.specialKind = specialKind;
-                            g_AnchorCache[obj] = entry;
                         }
                     }
                 }
@@ -1209,6 +1599,86 @@ void ApplyAdaptiveUiAnchors(double vpW, double vpH) {
             node = g_Sym.fnTreeNext(node);
         }
     }
+
+    if (pruneCache) {
+        for (auto it = g_AnchorCache.begin(); it != g_AnchorCache.end();) {
+            if (it->second.visited) {
+                ++it;
+            } else {
+                it = g_AnchorCache.erase(it);
+            }
+        }
+    }
+}
+
+// Far Cry 4 can still confine its menu pointer to the old centered 16:9
+// viewport after the patch expands rendering. Only replace that rectangle.
+bool MatchesLetterboxedCursorClip(const RECT& client, const RECT& clip) {
+    const LONG width = client.right - client.left;
+    const LONG height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    const LONG fitWidth = static_cast<LONG>(std::min<int64_t>(width, int64_t{height} * 16 / 9));
+    const LONG fitHeight = static_cast<LONG>(std::min<int64_t>(height, int64_t{width} * 9 / 16));
+    const LONG x = (width - fitWidth) / 2;
+    const LONG y = (height - fitHeight) / 2;
+    // Allow one pixel for centering and one for the engine's inclusive endpoint.
+    constexpr LONG tolerance = 2;
+    return (x > tolerance || y > tolerance) &&
+           std::abs(clip.left - (client.left + x)) <= tolerance &&
+           std::abs(clip.top - (client.top + y)) <= tolerance &&
+           std::abs(clip.right - (client.left + x + fitWidth)) <= tolerance &&
+           std::abs(clip.bottom - (client.top + y + fitHeight)) <= tolerance;
+}
+
+struct CursorClipState {
+    HWND window = nullptr;
+    RECT expanded{};
+};
+
+thread_local CursorClipState g_CursorClip;
+
+void ExpandLetterboxedCursorClip(HWND hWnd) {
+    if (!g_Config.enabled || (!g_Config.disableBlackBars && !g_Config.adaptiveUi) ||
+        InterlockedCompareExchange(&g_ShuttingDown, 0, 0) != 0 ||
+        GetForegroundWindow() != hWnd || IsIconic(hWnd)) {
+        return;
+    }
+
+    RECT client{};
+    RECT clip{};
+    if (!GetClientRect(hWnd, &client) || !GetClipCursor(&clip)) {
+        return;
+    }
+    POINT topLeft{client.left, client.top};
+    POINT bottomRight{client.right, client.bottom};
+    if (!ClientToScreen(hWnd, &topLeft) || !ClientToScreen(hWnd, &bottomRight)) {
+        return;
+    }
+    client = {topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+
+    if (MatchesLetterboxedCursorClip(client, clip) &&
+        GetForegroundWindow() == hWnd && ClipCursor(&client)) {
+        if (g_CursorClip.window != hWnd || !EqualRect(&g_CursorClip.expanded, &client)) {
+            HookEngine::LogMsg("[LIVE] Cursor clip expanded from [%ld,%ld,%ld,%ld] to [%ld,%ld,%ld,%ld]",
+                               clip.left, clip.top, clip.right, clip.bottom,
+                               client.left, client.top, client.right, client.bottom);
+        }
+        g_CursorClip = {hWnd, client};
+    }
+}
+
+void ReleaseExpandedCursorClip(HWND hWnd) {
+    if (g_CursorClip.window != hWnd) {
+        return;
+    }
+    RECT clip{};
+    if (GetClipCursor(&clip) && EqualRect(&clip, &g_CursorClip.expanded)) {
+        ClipCursor(nullptr);
+    }
+    g_CursorClip = {};
 }
 
 bool IsIgnoredSkipKey(WPARAM vk) {
@@ -1240,6 +1710,7 @@ LRESULT CALLBACK Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     if (msg == kMsgStartTimer) {
         SetTimer(hWnd, kAdaptiveTimerId, kAdaptiveTimerMs, nullptr);
         TickAdaptiveEngineOnMainThread();
+        ExpandLetterboxedCursorClip(hWnd);
         return 0;
     }
     if (msg == WM_TIMER && wParam == kAdaptiveTimerId) {
@@ -1248,10 +1719,15 @@ LRESULT CALLBACK Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HookEngine::LogMsg("[LIVE] Main-thread WM_TIMER heartbeat active (HWND=0x%p)", hWnd);
         }
         TickAdaptiveEngineOnMainThread();
+        ExpandLetterboxedCursorClip(hWnd);
         return 0;
     }
     if (msg == WM_SIZE || msg == WM_DISPLAYCHANGE || msg == WM_ACTIVATEAPP) {
         TickAdaptiveEngineOnMainThread();
+    }
+
+    if ((msg == WM_ACTIVATEAPP && !wParam) || msg == WM_DESTROY) {
+        ReleaseExpandedCursorClip(hWnd);
     }
 
     // Discrete in-game F8 toggle & any-button pre-recorded video skip

@@ -75,11 +75,14 @@ def main():
         default=os.environ.get("FC4_BIN_DIR", DEFAULT_BIN_DIR),
         help="Path to the Far Cry 4 bin directory containing FC64.dll and dinput8.dll",
     )
+    parser.add_argument(
+        "--proxy-dll",
+        help="Path to a staged dinput8.dll. Defaults to dinput8.dll in --bin-dir.",
+    )
     args = parser.parse_args()
     bin_dir = os.path.abspath(args.bin_dir)
+    proxy_path = os.path.abspath(args.proxy_dll) if args.proxy_dll else os.path.join(bin_dir, "dinput8.dll")
     os.chdir(bin_dir)
-
-    proxy_path = os.path.join(bin_dir, "dinput8.dll")
     pe = pefile.PE(proxy_path)
     assert pe.FILE_HEADER.Machine == 0x8664
     imports = [e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT]

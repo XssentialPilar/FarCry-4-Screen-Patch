@@ -11,6 +11,7 @@ Designed to adapt the game viewport and all internal Scaleform/Flash UI elements
 - **Pre-Recorded Video Aspect Fix & Any-Key Skip (`F8` Toggle)**: Expands pre-recorded Bink videos (startup intros and story cutscenes) edge-to-edge using aspect-preserving `Cover-Fit` without stretching, and provides an independent option to skip non-looping pre-recorded videos with any key, mouse click, or gamepad button (toggleable in-game anytime with `F8` via a discrete native prompt).
 - **Universal Aspect Ratio Support**: Tested across `4:3`, `5:4`, `4:5`, `3:2` (`1.50:1`), `16:10`, `16:9`, `1.85:1`, `2:1`, `18:9`, `19.5:9`, `20:9`, `21:9` (`2.375:1`), `2.35:1` / `2.39:1` / `2.40:1`, `2.76:1`, `9:16`, and `19.5:1`.
 - **Adaptive 9-Point UI and HUD Layout**: Dynamically updates active FireUI `UiAnchorObj` elements across loaded movies using uniform proportional scaling (`min(W / 1280, H / 720)`) for HUD/menus and `Cover-Fit` for full-screen backdrops.
+- **Full-Viewport Menu Cursor:** Expands the legacy 16:9 mouse confinement to the focused game window when the viewport is expanded.
 - **Correct Native FOV Scaling**: Automatically sets `UseWidescreenFOV` to **Vert+** (`0`) at `<= 16:9` (preventing horizontal cropping) and **Hor+** (`1`) at `> 16:9` (preserving vertical FOV).
 - **Resolution Filter Removal**: Hooks `ModeProvider` via its heap VTable to remove aspect-ratio filtering in the video options menu.
 
@@ -29,7 +30,7 @@ Captured in-game running on a 16:10 display with full edge-to-edge viewport rend
 
 ## Installation (Pre-built Release)
 
-1. Download the latest release archive (`FarCry4-Screen-Patch-v2.2.0.zip`) from the **Releases** page.
+1. Download the latest release archive from the [Releases page](https://github.com/XssentialPilar/FarCry-4-Screen-Patch/releases/latest).
 2. Extract `dinput8.dll` and `FC4_AspectFix.ini` directly into your Far Cry 4 `bin` folder (next to `FarCry4.exe` and `FC64.dll`), for example:
    ```text
    C:\Program Files (x86)\Steam\steamapps\common\Far Cry 4\bin\
